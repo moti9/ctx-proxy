@@ -260,3 +260,24 @@ def test_extra_params_cannot_clobber_proxy_owned_fields(config):
     assert sent["model"] == "internal-coder-v2"
     assert "hijacked" not in json.dumps(sent["messages"])
     assert sent["temperature"] == 0.1
+
+
+def test_invalid_config_serves_a_clear_error_instead_of_dying(tmp_path, monkeypatch):
+    """A dead worker shows up at the client as a *model* outage, not a proxy bug."""
+    from ctxproxy.app import app_factory
+
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("server:\n  totally_unknown_key: 1\nbackends: []\nprofiles: []\n")
+    monkeypatch.setenv("CTXPROXY_CONFIG", str(bad))
+
+    with TestClient(app_factory()) as client:
+        health = client.get("/health")
+        assert health.status_code == 503
+        assert health.json()["status"] == "config_error"
+
+        resp = client.post("/v1/messages", json={"model": "x", "messages": []})
+        assert resp.status_code == 503
+        body = resp.json()
+        assert body["type"] == "error"
+        assert "not a model outage" in body["error"]["message"]
+        assert "totally_unknown_key" in body["error"]["message"]

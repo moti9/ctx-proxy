@@ -139,10 +139,54 @@ def app_factory() -> FastAPI:
     so it needs an import string rather than a constructed app. Config is
     re-read here rather than captured, which is what makes edits to
     ctxproxy.yaml take effect on reload too — not just source changes.
+
+    A config that fails to load must NOT kill the worker. Letting it raise
+    leaves the port closed, so every client request fails at the TCP level —
+    and a client seeing connection-refused reports it as the *model* being
+    unavailable, which sends you looking at the wrong system entirely. Staying
+    up and answering with the actual parse error is far easier to diagnose, and
+    fixing the file triggers another reload that recovers automatically.
     """
     from .config import load_config
     from .logging import configure
 
-    config = load_config()
+    try:
+        config = load_config()
+    except Exception as exc:  # noqa: BLE001
+        configure("info", "text")
+        log.error("CONFIG INVALID — serving errors until it is fixed:\n%s", exc)
+        return _degraded_app(str(exc))
+
     configure(config.server.log_level, config.server.log_format)
     return create_app(config)
+
+
+def _degraded_app(reason: str) -> FastAPI:
+    """A stand-in that stays bound to the port and explains itself."""
+    app = FastAPI(title="ctxproxy (config error)", docs_url=None, redoc_url=None)
+
+    @app.get("/health")
+    async def health() -> JSONResponse:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "config_error", "detail": reason},
+        )
+
+    @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+    async def catch_all(path: str) -> JSONResponse:  # noqa: ARG001
+        return JSONResponse(
+            status_code=503,
+            content={
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": (
+                        "[ctxproxy] configuration is invalid, so no requests can be "
+                        f"served. This is a proxy problem, not a model outage. "
+                        f"Fix ctxproxy.yaml and it will reload automatically.\n\n{reason}"
+                    ),
+                },
+            },
+        )
+
+    return app
