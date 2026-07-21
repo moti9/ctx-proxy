@@ -1,0 +1,119 @@
+# ctxproxy configuration
+#
+# Point Claude Code at this proxy:
+#   export ANTHROPIC_BASE_URL=http://127.0.0.1:4000
+#   export ANTHROPIC_AUTH_TOKEN=<whatever your backend expects>
+#
+# Validate before launching Claude Code:
+#   ctxproxy doctor
+
+server:
+  host: 127.0.0.1
+  port: 4000
+  log_level: info
+  log_format: text          # text | json
+  session_ttl_hours: 72
+
+policy:
+  # Reduce once usable context exceeds this fraction of the budget.
+  trigger_ratio: 0.75
+  # Reduce down to this fraction. The gap is hysteresis — without it every
+  # turn re-triggers and you pay a summarisation pass per turn.
+  target_ratio: 0.55
+
+  keep_recent_turns: 8            # always kept verbatim
+  keep_recent_tool_results: 6     # tool payloads exempt from clearing
+  min_messages_to_compact: 12
+
+  # Cheapest and least lossy first. Junk is evicted before reasoning is ever
+  # summarised.
+  strategies:
+    - clear_tool_results
+    - clear_thinking
+    - compact
+
+  # On an upstream context-overflow, force a pass at this ratio and retry once.
+  overflow_retry_enabled: true
+  overflow_retry_ratio: 0.40
+
+backends:
+  # ---- Native Anthropic ---------------------------------------------------
+  - name: anthropic
+    kind: anthropic
+    base_url: https://api.anthropic.com
+    # Omit api_key_env to forward whatever credential Claude Code already sends.
+    api_key_env: ANTHROPIC_API_KEY
+    allowed_beta_flags: ["*"]
+
+  # ---- Your models (LiteLLM, vLLM, internal gateway) -----------------------
+  - name: internal
+    kind: openai
+    base_url: ${INTERNAL_LLM_BASE_URL:-http://127.0.0.1:8000}
+    api_key_env: INTERNAL_LLM_API_KEY
+    openai_max_tokens_field: max_tokens   # or max_completion_tokens
+    openai_stream_usage: true             # set false if the gateway 400s on stream_options
+
+    # Reasoning models (DeepSeek-R1, kimi-k2, QwQ, ...) return a separate
+    # `reasoning_content` field. Anthropic has no client-visible equivalent, so
+    # it is either rendered as a text block ("text" — the chain of thought shows
+    # up inline in Claude Code) or discarded ("drop").
+    # "text" is the safe default: some models leave `content` empty and put the
+    # answer in `reasoning_content`. The proxy falls back to showing reasoning
+    # when a turn would otherwise be empty, so "drop" cannot silence a response.
+    openai_reasoning_output: text         # text | drop
+
+profiles:
+  # First match wins, so order matters. Keep the catch-all last.
+
+  # ---- Native Anthropic path ----------------------------------------------
+  # Nothing is translated; the model can also compact server-side.
+  - match: "claude-*"
+    backend: anthropic
+    native_anthropic: true
+    context_window: 200000        # 1000000 only if your org is entitled
+    output_reserve: 32000
+    safety_buffer: 12000
+    supports_count_tokens: true
+    supports_prompt_caching: true
+    supports_server_compaction: true
+    tokenizer:
+      kind: upstream
+
+  # ---- Your own model via an OpenAI-compatible endpoint --------------------
+  - match: "our-coder"
+    backend: internal
+    upstream_model: your-model-name       # what the gateway actually calls it
+    native_anthropic: false
+    context_window: 128000                # the REAL window — this is the field
+                                          # that most often causes hard failures
+    # Hard ceiling on generation, when the backend enforces one separately from
+    # the context window. Claude Code routinely asks for 32K+, and a backend
+    # capped lower rejects the request outright rather than clamping, so set
+    # this whenever your model advertises a max_output_tokens.
+    max_output_tokens: 16000
+    output_reserve: 16000
+    safety_buffer: 8000
+    supports_count_tokens: false          # no such endpoint on OpenAI-compatible
+    supports_prompt_caching: false
+    supports_server_compaction: false
+    tokenizer:
+      kind: heuristic                     # or: tiktoken (needs the extras)
+      chars_per_token: 3.5
+      safety_multiplier: 1.10
+    # Run the task on the cheap model, write summaries with a strong one.
+    # A bad summary poisons every subsequent turn, so this trade usually pays.
+    summarizer: "claude-*"
+
+  # ---- Catch-all -----------------------------------------------------------
+  # Without this, an unrecognised model name is a clear 400 rather than a
+  # silent fallback to wrong window assumptions.
+  - match: "*"
+    backend: internal
+    native_anthropic: false
+    context_window: 128000
+    output_reserve: 16000
+    safety_buffer: 8000
+    supports_count_tokens: false
+    supports_prompt_caching: false
+    tokenizer:
+      kind: heuristic

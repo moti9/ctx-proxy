@@ -1,0 +1,281 @@
+"""HTTP surface: the Anthropic Messages API, plus operational endpoints."""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import AsyncIterator
+
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+
+from .config import UnknownModelError
+from .context.budget import compute_budget
+from .errors import ConfigurationError, ProxyError, UpstreamError
+from .logging import log_event
+from .session import derive_session_key
+from .state import AppState
+from .types_anthropic import CountTokensRequest, MessagesRequest
+
+log = logging.getLogger(__name__)
+
+router = APIRouter()
+
+
+def _state(request: Request) -> AppState:
+    return request.app.state.ctx
+
+
+@router.post("/v1/messages")
+async def create_message(http_request: Request):
+    state = _state(http_request)
+    body = await http_request.json()
+
+    try:
+        req = MessagesRequest.model_validate(body)
+    except Exception as exc:  # noqa: BLE001
+        return ConfigurationError(f"malformed request body: {exc}").to_response()
+
+    try:
+        profile = state.config.profile_for(req.model)
+    except UnknownModelError as exc:
+        return ConfigurationError(str(exc)).to_response()
+
+    upstream_model = profile.resolve_upstream_model(req.model)
+    session = derive_session_key(http_request.headers, req)
+    counter = state.counter_for(profile, upstream_model)
+    summarizer = state.summarizer_for(profile, req.model)
+    backend = state.backend_for(profile)
+    headers = dict(http_request.headers)
+
+    async def reduce(target_ratio: float | None = None):
+        # Re-validate from the untouched body: the pipeline mutates the request
+        # in place, so a retry must start from the client's original payload,
+        # not from the already-reduced one.
+        fresh = MessagesRequest.model_validate(body)
+        return await state.manager.process(
+            fresh,
+            profile=profile,
+            session_key=session.value,
+            counter=counter,
+            summarizer=summarizer,
+            target_ratio=target_ratio,
+        )
+
+    try:
+        result, _ledger = await reduce()
+    except ProxyError as exc:
+        return exc.to_response()
+
+    prepared = _prepare(result.request, profile)
+    policy = state.config.policy
+
+    log_event(
+        log,
+        "dispatch",
+        session=session.value,
+        source=session.source,
+        model=req.model,
+        upstream=upstream_model,
+        backend=backend.name,
+        tokens=result.tokens_after,
+        saved=result.saved,
+        stream=req.stream,
+    )
+
+    # -- streaming ---------------------------------------------------------- #
+    if req.stream:
+        try:
+            first, stream = await _open_stream(
+                backend, prepared, upstream_model, headers, result.tokens_after
+            )
+        except UpstreamError as exc:
+            if not (exc.is_context_overflow() and policy.overflow_retry_enabled):
+                return exc.to_response()
+
+            log_event(
+                log,
+                "upstream reported overflow; forcing reduction and retrying once",
+                level=logging.WARNING,
+                session=session.value,
+                tokens=result.tokens_after,
+            )
+            try:
+                retry, _ = await reduce(target_ratio=policy.overflow_retry_ratio)
+                prepared = _prepare(retry.request, profile)
+                first, stream = await _open_stream(
+                    backend, prepared, upstream_model, headers, retry.tokens_after
+                )
+            except (UpstreamError, ProxyError) as retry_exc:
+                return retry_exc.to_response()
+
+        return StreamingResponse(
+            _replay(first, stream),
+            media_type="text/event-stream",
+            headers={"cache-control": "no-cache", "x-ctxproxy-session": session.value},
+        )
+
+    # -- non-streaming ------------------------------------------------------ #
+    try:
+        payload = await backend.complete(prepared, upstream_model, headers)
+    except UpstreamError as exc:
+        if not (exc.is_context_overflow() and policy.overflow_retry_enabled):
+            return exc.to_response()
+
+        log_event(
+            log,
+            "upstream reported overflow; forcing reduction and retrying once",
+            level=logging.WARNING,
+            session=session.value,
+        )
+        try:
+            retry, _ = await reduce(target_ratio=policy.overflow_retry_ratio)
+            payload = await backend.complete(
+                _prepare(retry.request, profile), upstream_model, headers
+            )
+        except (UpstreamError, ProxyError) as retry_exc:
+            return retry_exc.to_response()
+
+    return JSONResponse(payload, headers={"x-ctxproxy-session": session.value})
+
+
+@router.post("/v1/messages/count_tokens")
+async def count_tokens(http_request: Request):
+    """Report what the request will cost *after* our reduction.
+
+    This endpoint is load-bearing for behaviour, not just display. Claude Code
+    drives its own auto-compact off these numbers, so reporting the raw
+    pre-reduction count makes the client compact on top of us — double
+    compaction, double loss. Reporting the post-reduction figure keeps the
+    client's HUD honest and leaves context management in one place.
+    """
+    state = _state(http_request)
+    body = await http_request.json()
+
+    try:
+        req = CountTokensRequest.model_validate(body)
+    except Exception as exc:  # noqa: BLE001
+        return ConfigurationError(f"malformed request body: {exc}").to_response()
+
+    try:
+        profile = state.config.profile_for(req.model)
+    except UnknownModelError as exc:
+        return ConfigurationError(str(exc)).to_response()
+
+    upstream_model = profile.resolve_upstream_model(req.model)
+    counter = state.counter_for(profile, upstream_model)
+
+    messages_request = req.to_messages_request()
+    actual = await counter.count_request(messages_request)
+    budget = compute_budget(profile, state.config.policy, messages_request)
+
+    # Above the trigger the next /v1/messages call is guaranteed to reduce to
+    # at most `target_at`, so that is the honest figure to report.
+    reported = actual if actual <= budget.trigger_at else budget.target_at
+
+    if reported != actual:
+        log_event(
+            log,
+            "count_tokens capped to post-reduction estimate",
+            model=req.model,
+            actual=actual,
+            reported=reported,
+        )
+
+    return JSONResponse({"input_tokens": reported})
+
+
+@router.get("/health")
+async def health(http_request: Request):
+    state = _state(http_request)
+    return {
+        "status": "ok",
+        "backends": [b.name for b in state.config.backends],
+        "profiles": [
+            {
+                "match": p.match,
+                "backend": p.backend,
+                "native_anthropic": p.native_anthropic,
+                "context_window": p.context_window,
+            }
+            for p in state.config.profiles
+        ],
+    }
+
+
+@router.get("/stats")
+async def stats(http_request: Request):
+    state = _state(http_request)
+    ledgers = await state.store.list_all()
+    return {
+        "sessions": len(ledgers),
+        "total_tokens_saved": sum(item.total_tokens_saved for item in ledgers),
+        "total_compactions": sum(item.compaction_count for item in ledgers),
+        "detail": [item.stats() for item in ledgers[:50]],
+    }
+
+
+@router.get("/v1/models")
+async def models(http_request: Request):
+    state = _state(http_request)
+    return {
+        "data": [
+            {"id": p.match, "type": "model", "display_name": p.match}
+            for p in state.config.profiles
+        ]
+    }
+
+
+# --------------------------------------------------------------------------- #
+
+
+def _prepare(request: MessagesRequest, profile) -> MessagesRequest:
+    """Final per-backend adjustments before dispatch."""
+    if profile.native_anthropic and profile.supports_server_compaction:
+        # Belt and braces: we have already reduced client-side, but letting the
+        # upstream compact server-side too means the model itself writes any
+        # further summary — strictly better than anything we can do here.
+        request.context_management = request.context_management or {
+            "edits": [{"type": "clear_tool_uses_20250919"}]
+        }
+    elif not profile.native_anthropic:
+        # Meaningless downstream, and rejected by some gateways.
+        request.context_management = None
+        if not profile.supports_prompt_caching:
+            _strip_cache_control(request)
+    return request
+
+
+def _strip_cache_control(request: MessagesRequest) -> None:
+    for message in request.messages:
+        blocks = message.blocks()
+        if any("cache_control" in b for b in blocks):
+            message.content = [
+                {k: v for k, v in b.items() if k != "cache_control"} for b in blocks
+            ]
+    if isinstance(request.system, list):
+        request.system = [
+            {k: v for k, v in b.items() if k != "cache_control"} for b in request.system
+        ]
+
+
+async def _open_stream(backend, request, upstream_model, headers, input_tokens):
+    """Start a stream and pull the first chunk.
+
+    Pulling eagerly is what makes retry-on-overflow possible: the upstream
+    status is checked before any byte reaches the client, so a context-overflow
+    rejection can still be recovered from. Once bytes are flushed, it is too
+    late.
+    """
+    stream = backend.stream(request, upstream_model, headers, input_tokens)
+    try:
+        first = await stream.__anext__()
+    except StopAsyncIteration:
+        first = None
+    return first, stream
+
+
+async def _replay(first: bytes | None, stream) -> AsyncIterator[bytes]:
+    if first is not None:
+        yield first
+    async for chunk in stream:
+        yield chunk

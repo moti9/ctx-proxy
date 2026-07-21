@@ -1,0 +1,64 @@
+# --- secrets & local config -------------------------------------------------
+# ctxproxy.yaml is intentionally ignored: it names your gateway and (via
+# api_key_env) your credential setup. Commit config.example.yaml instead and
+# let each developer run `ctxproxy init`.
+ctxproxy.yaml
+config.yaml
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# --- ctxproxy runtime state -------------------------------------------------
+# Session ledgers contain rolling summaries of real conversations — source
+# code, file paths, and error text. Never commit these.
+.ctxproxy/
+sessions/
+e2e-state/
+*.ledger.json
+
+# --- python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# --- virtualenvs ------------------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+
+# --- tooling caches ---------------------------------------------------------
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.tox/
+.nox/
+.hypothesis/
+
+# --- editors / OS -----------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# --- logs & scratch ---------------------------------------------------------
+*.log
+nohup.out
+/tmp/
+scratch/
