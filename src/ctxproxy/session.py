@@ -79,15 +79,24 @@ def derive_session_key(headers: Mapping[str, str], request: MessagesRequest) -> 
 def _fingerprint(request: MessagesRequest) -> str:
     """Hash the parts of a conversation that do not change as it grows.
 
-    Uses the system prompt and the first plain user turn. Tool-result carriers
-    are skipped because in a resumed session the first message can be a
-    tool_result whose content varies.
+    Only the model and the first genuine user turn — the task statement. That
+    is fixed for the life of a conversation and distinct between conversations.
+
+    The system prompt is deliberately excluded. It looks like an obvious
+    ingredient, but Claude Code rebuilds it every turn with volatile content
+    (working directory, git state, environment details), so including it makes
+    the fingerprint drift mid-conversation. The failure is quiet and expensive:
+    a new key means an orphaned ledger, which means the recorded fold is lost
+    and the whole history gets re-compacted from scratch.
+
+    Trade-off: two conversations opening with a byte-identical first message
+    against the same model share a key. They then share a rolling summary,
+    which is untidy but self-correcting — the fold signature stops matching and
+    the fold is rebuilt. Drifting keys are the far worse failure, and the
+    session header (used whenever present) avoids both.
     """
     hasher = hashlib.sha256()
     hasher.update(request.model.encode())
-
-    system_text = "\n".join(b.get("text", "") for b in request.system_blocks())
-    hasher.update(system_text[:_FINGERPRINT_CHARS].encode())
 
     for msg in request.messages:
         if is_plain_user_turn(msg):
