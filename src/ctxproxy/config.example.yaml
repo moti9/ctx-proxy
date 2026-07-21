@@ -16,6 +16,7 @@ server:
   # Ledgers (small: rolling summary + counters) and fold archives (large: raw
   # transcripts of everything compaction removed) both live under state_dir.
   session_ttl_hours: 72        # delete state untouched for this long
+  # archive_ttl_hours: 168     # keep archives a shorter time than ledgers
   prune_interval_hours: 6      # re-run retention while the server is up; 0 = startup only
   archive_max_mb: 25           # per-session archive cap; oldest folds dropped first
 

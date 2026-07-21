@@ -231,10 +231,25 @@ class ServerConfig(BaseModel):
     # 0 disables the periodic sweep (startup still prunes).
     prune_interval_hours: int = 6
 
+    # How long to keep raw fold archives. Unset means "same as the ledger".
+    # Worth setting shorter than session_ttl_hours: ledgers are kilobytes
+    # and stay useful for the life of a session, whereas archives are whole
+    # transcripts and are almost only ever read while debugging something
+    # recent.
+    archive_ttl_hours: int | None = None
+
     # Per-session cap on the raw fold archive. Archives hold full
     # transcripts, so they are far larger than ledgers; when a session
     # exceeds this the oldest folds are dropped first.
     archive_max_mb: int = 25
+
+    @property
+    def effective_archive_ttl_hours(self) -> int:
+        return (
+            self.archive_ttl_hours
+            if self.archive_ttl_hours is not None
+            else self.session_ttl_hours
+        )
 
 
 class Config(BaseModel):

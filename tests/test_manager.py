@@ -413,3 +413,18 @@ async def test_archive_prune_removes_expired_files(tmp_path):
     assert archive.prune(ttl_hours=72) == 1
     assert not path.exists()
     assert archive.prune(ttl_hours=0) == 0, "ttl 0 must disable pruning"
+
+
+def test_archive_ttl_defaults_to_the_ledger_ttl():
+    from ctxproxy.config import ServerConfig
+
+    assert ServerConfig(session_ttl_hours=720).effective_archive_ttl_hours == 720
+
+
+def test_archive_ttl_can_be_shorter_than_the_ledger_ttl():
+    """Ledgers are kilobytes; archives are whole transcripts."""
+    from ctxproxy.config import ServerConfig
+
+    cfg = ServerConfig(session_ttl_hours=720, archive_ttl_hours=168)
+    assert cfg.session_ttl_hours == 720
+    assert cfg.effective_archive_ttl_hours == 168

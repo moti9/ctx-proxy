@@ -18,7 +18,7 @@ from .state import AppState
 log = logging.getLogger(__name__)
 
 
-async def _prune(state, ttl_hours: int) -> None:
+async def _prune(state, ttl_hours: int, archive_ttl_hours: int | None = None) -> None:
     """Delete expired ledgers and their archives.
 
     Archives are pruned alongside ledgers rather than on their own schedule:
@@ -27,13 +27,16 @@ async def _prune(state, ttl_hours: int) -> None:
     """
     try:
         ledgers = await state.store.prune(ttl_hours)
-        archives = await asyncio.to_thread(state.archive.prune, ttl_hours)
+        archives = await asyncio.to_thread(
+            state.archive.prune, archive_ttl_hours or ttl_hours
+        )
         if ledgers or archives:
             log.info(
-                "retention: removed %d ledger(s) and %d archive(s) older than %dh",
+                "retention: removed %d ledger(s) (>%dh) and %d archive(s) (>%dh)",
                 ledgers,
-                archives,
                 ttl_hours,
+                archives,
+                archive_ttl_hours or ttl_hours,
             )
     except Exception:  # noqa: BLE001 — housekeeping must never take the proxy down
         log.exception("retention sweep failed")
@@ -43,7 +46,11 @@ async def _prune_periodically(state, config: Config) -> None:
     interval = config.server.prune_interval_hours * 3600
     while True:
         await asyncio.sleep(interval)
-        await _prune(state, config.server.session_ttl_hours)
+        await _prune(
+            state,
+            config.server.session_ttl_hours,
+            config.server.effective_archive_ttl_hours,
+        )
 
 
 def create_app(config: Config) -> FastAPI:
@@ -52,7 +59,11 @@ def create_app(config: Config) -> FastAPI:
         state = AppState(config)
         app.state.ctx = state
 
-        await _prune(state, config.server.session_ttl_hours)
+        await _prune(
+            state,
+            config.server.session_ttl_hours,
+            config.server.effective_archive_ttl_hours,
+        )
 
         # Startup-only pruning leaves a proxy that runs for weeks accumulating
         # state forever, which is exactly the long-session case this exists for.

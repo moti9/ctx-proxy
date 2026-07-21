@@ -230,13 +230,18 @@ State lives under `server.state_dir` (default `~/.ctxproxy/sessions/`):
 | Archives `archive/<session>.jsonl` | up to `archive_max_mb` | Only by you, via `ctxproxy archive` |
 
 ```yaml
-session_ttl_hours: 72        # delete state untouched for this long
+session_ttl_hours: 720       # ledgers — small, keep them a month
+archive_ttl_hours: 168       # archives — large; omit to reuse session_ttl_hours
 prune_interval_hours: 6      # sweep while running; 0 = startup only
 archive_max_mb: 25           # per-session cap, oldest folds dropped first
 ```
 
-Worst case is `archive_max_mb` x concurrent sessions inside the TTL window. Set
-`archive_max_mb: 0` to disable archiving entirely if disk is tight.
+Worth keeping these apart. Ledgers are kilobytes and stay useful for the life of
+a session; archives are whole transcripts and are almost only ever read while
+debugging something recent, so a long ledger TTL should not drag them along.
+
+Worst case is `archive_max_mb` x sessions that compacted inside the **archive**
+window. Set `archive_max_mb: 0` to disable archiving entirely if disk is tight.
 
 ### Policy
 
@@ -381,7 +386,7 @@ ctxproxy owns context.
 
 ```bash
 uv pip install -e ".[dev,tokenizers]"
-pytest -q          # 103 tests
+pytest -q          # 105 tests
 ruff check src tests
 ```
 
