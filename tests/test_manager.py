@@ -12,6 +12,7 @@ from conftest import (
     user,
 )
 
+from ctxproxy.context.ledger import SessionLedger
 from ctxproxy.context.manager import ContextManager
 from ctxproxy.store.file import FileLedgerStore
 from ctxproxy.tokens.local import HeuristicCounter
@@ -264,3 +265,45 @@ async def test_max_tokens_below_the_ceiling_is_left_alone(
     request = make_request(build_conversation(1, 50), max_tokens=4_096)
     await run(manager, request, openai_profile, counter, FakeSummarizer())
     assert request.max_tokens == 4_096
+
+
+async def test_cleared_tool_result_names_the_call_and_says_to_re_run(
+    manager, openai_profile, counter
+):
+    """A bare placeholder invites the model to confabulate the missing output."""
+    request = make_request(build_conversation(exchanges=20, payload_size=4000))
+    await run(manager, request, openai_profile, counter, FakeSummarizer())
+
+    cleared = [
+        b.get("content", "")
+        for m in request.messages
+        for b in m.blocks()
+        if b.get("type") == "tool_result" and str(b.get("content", "")).startswith("[cleared")
+    ]
+    assert cleared, "expected at least one cleared tool result"
+    sample = cleared[0]
+    assert "read_file" in sample, "placeholder must name the call that produced it"
+    assert "src/mod_" in sample, "placeholder must carry the call's arguments"
+    assert "do not" in sample.lower() and "memory" in sample.lower()
+
+
+async def test_dropped_anchors_are_reattached_to_the_summary():
+    """A weak summariser silently generalises identifiers away; we re-attach them."""
+    from ctxproxy.config import ModelProfile
+    from ctxproxy.context.summarizer import Summarizer
+
+    async def lazy_summariser(request):
+        return "## State\nDid some work on the payments code."   # drops every path
+
+    profile = ModelProfile(match="s", backend="internal", context_window=32000)
+    summarizer = Summarizer(lazy_summariser, profile)
+
+    span = build_conversation(exchanges=4, payload_size=100)
+    span.append(tool_result("toolu_x", "PermissionError: /etc/secrets denied", True))
+    ledger = SessionLedger(session_key="k")
+
+    summary = await summarizer.fold(span, ledger)
+
+    assert "src/mod_0.py" in summary, "file path must survive the summariser"
+    assert "PermissionError" in summary, "error text must survive the summariser"
+    assert "preserved verbatim" in summary

@@ -34,6 +34,10 @@ log = logging.getLogger(__name__)
 
 SummarizeFn = Callable[[list[Message], SessionLedger], Awaitable[str]]
 
+# Every generated placeholder starts with this, so an already-cleared block is
+# recognisable on later turns without adding a non-standard field to the block.
+_CLEARED_PREFIX = "[cleared to reclaim context]"
+
 _PATH_RE = re.compile(r"(?:^|[\s\"'`(])(/?(?:[\w.-]+/){1,}[\w.-]+\.\w{1,8})")
 
 
@@ -97,6 +101,12 @@ class ClearToolResults:
         if not positions:
             return None
 
+        # What each cleared result was the answer to. A bare "[cleared]" tells
+        # the model something is missing but not what, which invites it to
+        # reconstruct the content from memory — naming the exact call and
+        # saying it can be re-run makes re-reading the obvious move instead.
+        calls = _tool_call_index(ctx.messages)
+
         # Exempt the most recent K results: the assistant is very likely still
         # reasoning about those.
         exempt = set(positions[-ctx.policy.keep_recent_tool_results :])
@@ -117,7 +127,8 @@ class ClearToolResults:
             tool_use_id = block.get("tool_use_id", "")
             if ctx.protected.protects_tool_result(tool_use_id):
                 continue
-            if block.get("content") == placeholder:
+            content = block.get("content")
+            if isinstance(content, str) and content.startswith(_CLEARED_PREFIX):
                 # Already cleared on an earlier turn. Detected by content rather
                 # than a marker field: anything we add to the block is serialised
                 # upstream, and strict backends reject unknown keys.
@@ -127,7 +138,7 @@ class ClearToolResults:
             replacement = {
                 "type": "tool_result",
                 "tool_use_id": tool_use_id,
-                "content": placeholder,
+                "content": _placeholder_for(tool_use_id, calls, placeholder),
             }
             if block.get("is_error"):
                 replacement["is_error"] = True
@@ -330,6 +341,49 @@ class Compact:
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+
+
+def _tool_call_index(messages: list[Message]) -> dict[str, tuple[str, str]]:
+    """Map tool_use_id -> (tool name, compact rendering of its input)."""
+    index: dict[str, tuple[str, str]] = {}
+    for msg in messages:
+        for block in msg.blocks():
+            if block.get("type") == "tool_use" and block.get("id"):
+                index[block["id"]] = (
+                    block.get("name", "tool"),
+                    _render_input(block.get("input")),
+                )
+    return index
+
+
+def _render_input(value: object, limit: int = 120) -> str:
+    if not isinstance(value, dict) or not value:
+        return ""
+    parts = []
+    for key, item in value.items():
+        text = item if isinstance(item, str) else str(item)
+        if len(text) > 60:
+            text = text[:60] + "..."
+        parts.append(f"{key}={text!r}")
+    rendered = ", ".join(parts)
+    return rendered[:limit] + ("..." if len(rendered) > limit else "")
+
+
+def _placeholder_for(
+    tool_use_id: str, calls: dict[str, tuple[str, str]], fallback: str
+) -> str:
+    """Placeholder naming the call, so the model re-runs instead of guessing."""
+    call = calls.get(tool_use_id)
+    if not call:
+        return f"{_CLEARED_PREFIX} {fallback}"
+    name, rendered = call
+    signature = f"{name}({rendered})" if rendered else name
+    return (
+        f"{_CLEARED_PREFIX} This was the output of `{signature}`. "
+        f"It was removed to stay within the context window, not because it was "
+        f"unimportant. Re-run the tool if you need its contents — do not "
+        f"reconstruct them from memory."
+    )
 
 
 def _tool_result_positions(messages: list[Message]) -> list[tuple[int, int]]:
