@@ -20,6 +20,9 @@ log = logging.getLogger(__name__)
 
 router = APIRouter()
 
+# Below this, fixed per-request overhead swamps the tokenizer signal.
+_MIN_TOKENS_FOR_DRIFT = 5_000
+
 
 def _state(request: Request) -> AppState:
     return request.app.state.ctx
@@ -84,9 +87,11 @@ async def create_message(http_request: Request):
 
     # -- streaming ---------------------------------------------------------- #
     if req.stream:
+        observed: list[int] = []
         try:
             first, stream = await _open_stream(
-                backend, prepared, upstream_model, headers, result.tokens_after
+                backend, prepared, upstream_model, headers, result.tokens_after,
+                observed.append,
             )
         except UpstreamError as exc:
             if not (exc.is_context_overflow() and policy.overflow_retry_enabled):
@@ -103,13 +108,14 @@ async def create_message(http_request: Request):
                 retry, _ = await reduce(target_ratio=policy.overflow_retry_ratio)
                 prepared = _prepare(retry.request, profile)
                 first, stream = await _open_stream(
-                    backend, prepared, upstream_model, headers, retry.tokens_after
+                    backend, prepared, upstream_model, headers, retry.tokens_after,
+                    observed.append,
                 )
             except (UpstreamError, ProxyError) as retry_exc:
                 return retry_exc.to_response()
 
         return StreamingResponse(
-            _replay(first, stream),
+            _replay(first, stream, state, session.value, result.tokens_after, observed),
             media_type="text/event-stream",
             headers={"cache-control": "no-cache", "x-ctxproxy-session": session.value},
         )
@@ -135,6 +141,7 @@ async def create_message(http_request: Request):
         except (UpstreamError, ProxyError) as retry_exc:
             return retry_exc.to_response()
 
+    await _record_drift(state, session.value, result.tokens_after, payload)
     return JSONResponse(payload, headers={"x-ctxproxy-session": session.value})
 
 
@@ -228,6 +235,59 @@ async def models(http_request: Request):
 # --------------------------------------------------------------------------- #
 
 
+async def _record_drift(state, session_key: str, estimated: int, payload: dict) -> None:
+    """Compare our token estimate against what the backend actually charged.
+
+    Our counter is an approximation — cl100k is not the tokenizer most
+    non-Anthropic models use. Under-counting is the dangerous direction: it
+    delays compaction until the request no longer fits the real window. This
+    turns that risk from a guess into a number you can act on.
+    """
+    actual = ((payload or {}).get("usage") or {}).get("input_tokens") or 0
+    if actual <= 0 or estimated <= 0:
+        return
+
+    # Backends add a fixed overhead our count cannot see — the chat template
+    # and any built-in system prompt. On a small request that constant
+    # dominates and the ratio is meaningless (a 10-token prompt billed at 570
+    # reads as 57x drift, which says nothing about the tokenizer). Only sample
+    # once the conversation is large enough for the constant to wash out.
+    if estimated < _MIN_TOKENS_FOR_DRIFT:
+        return
+
+    ledger = await state.store.load(session_key)
+    if ledger is None:
+        return
+
+    ratio = ledger.record_token_drift(estimated, actual)
+    await state.store.save(ledger)
+    if ratio is None:
+        return
+
+    median = ledger.median_token_drift or ratio
+    if median > 1.10 and len(ledger.token_drift_samples) >= 5:
+        log_event(
+            log,
+            "token estimates are running low; compaction may fire too late",
+            level=logging.WARNING,
+            session=session_key,
+            estimated=estimated,
+            actual=actual,
+            median_ratio=round(median, 3),
+            hint=f"raise tokenizer.safety_multiplier to about {median * 1.05:.2f}",
+        )
+    else:
+        log_event(
+            log,
+            "token drift",
+            level=logging.DEBUG,
+            session=session_key,
+            estimated=estimated,
+            actual=actual,
+            ratio=round(ratio, 3),
+        )
+
+
 def _prepare(request: MessagesRequest, profile) -> MessagesRequest:
     """Final per-backend adjustments before dispatch."""
     if profile.native_anthropic and profile.supports_server_compaction:
@@ -258,7 +318,7 @@ def _strip_cache_control(request: MessagesRequest) -> None:
         ]
 
 
-async def _open_stream(backend, request, upstream_model, headers, input_tokens):
+async def _open_stream(backend, request, upstream_model, headers, input_tokens, on_usage=None):
     """Start a stream and pull the first chunk.
 
     Pulling eagerly is what makes retry-on-overflow possible: the upstream
@@ -266,7 +326,7 @@ async def _open_stream(backend, request, upstream_model, headers, input_tokens):
     rejection can still be recovered from. Once bytes are flushed, it is too
     late.
     """
-    stream = backend.stream(request, upstream_model, headers, input_tokens)
+    stream = backend.stream(request, upstream_model, headers, input_tokens, on_usage)
     try:
         first = await stream.__anext__()
     except StopAsyncIteration:
@@ -274,8 +334,21 @@ async def _open_stream(backend, request, upstream_model, headers, input_tokens):
     return first, stream
 
 
-async def _replay(first: bytes | None, stream) -> AsyncIterator[bytes]:
+async def _replay(
+    first: bytes | None,
+    stream,
+    state=None,
+    session_key: str = "",
+    estimated: int = 0,
+    observed: list[int] | None = None,
+) -> AsyncIterator[bytes]:
     if first is not None:
         yield first
     async for chunk in stream:
         yield chunk
+
+    # The usage trailer only lands once the stream is fully consumed.
+    if state is not None and observed:
+        await _record_drift(
+            state, session_key, estimated, {"usage": {"input_tokens": observed[-1]}}
+        )

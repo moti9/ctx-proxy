@@ -49,6 +49,9 @@ class OpenAIStreamTranslator:
     _tools: dict[int, _ToolBlock] = field(default_factory=dict)
     _stop_reason: str = "end_turn"
     _output_tokens: int = 0
+    # What the backend says the prompt cost, kept apart from `input_tokens`
+    # (our estimate) so the two can be compared afterwards.
+    upstream_input_tokens: int = 0
     _dropped_reasoning: list[str] = field(default_factory=list)
     _emitted_content: bool = False
 
@@ -88,8 +91,10 @@ class OpenAIStreamTranslator:
 
         if usage := chunk.get("usage"):
             self._output_tokens = usage.get("completion_tokens", self._output_tokens)
-            if not self.input_tokens:
-                self.input_tokens = usage.get("prompt_tokens", 0)
+            if prompt := usage.get("prompt_tokens"):
+                self.upstream_input_tokens = prompt
+                if not self.input_tokens:
+                    self.input_tokens = prompt
 
         choices = chunk.get("choices") or []
         if not choices:

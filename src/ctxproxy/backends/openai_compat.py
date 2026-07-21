@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 
 import httpx
 
@@ -73,6 +73,7 @@ class OpenAICompatBackend(Backend):
         upstream_model: str,
         client_headers: Mapping[str, str],
         input_tokens: int = 0,
+        on_usage: Callable[[int], None] | None = None,
     ) -> AsyncIterator[bytes]:
         payload = anthropic_to_openai(
             request,
@@ -113,6 +114,11 @@ class OpenAICompatBackend(Backend):
 
                 for event in translator.finish():
                     yield event
+
+                # Claude Code streams almost everything, so this is where
+                # token-drift samples actually come from.
+                if on_usage and translator.upstream_input_tokens:
+                    on_usage(translator.upstream_input_tokens)
 
         except UpstreamError:
             raise

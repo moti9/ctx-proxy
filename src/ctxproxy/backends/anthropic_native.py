@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 
 import httpx
 
@@ -37,6 +37,7 @@ class AnthropicBackend(Backend):
         upstream_model: str,
         client_headers: Mapping[str, str],
         input_tokens: int = 0,  # noqa: ARG002 — upstream reports real counts itself
+        on_usage: Callable[[int], None] | None = None,  # noqa: ARG002
     ) -> AsyncIterator[bytes]:
         payload = self._payload(request, upstream_model, stream=True)
         headers = self._headers(client_headers)

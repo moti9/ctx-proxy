@@ -19,6 +19,7 @@ matching and we rebuild rather than silently mis-splicing the conversation.
 from __future__ import annotations
 
 import hashlib
+import statistics
 from datetime import UTC, datetime
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -63,6 +64,11 @@ class SessionLedger(BaseModel):
     files_touched: list[str] = Field(default_factory=list)
     open_questions: list[str] = Field(default_factory=list)
     decisions: list[str] = Field(default_factory=list)
+
+    # Ratio of the backend's reported prompt tokens to our own estimate.
+    # >1 means we UNDER-count, which is the dangerous direction: it delays
+    # compaction and lets a request overflow the real window.
+    token_drift_samples: list[float] = Field(default_factory=list)
 
     compaction_count: int = 0
     total_tokens_saved: int = 0
@@ -141,6 +147,21 @@ class SessionLedger(BaseModel):
             del self.events[: len(self.events) - MAX_TRACKED_EVENTS]
         self.touch()
 
+    def record_token_drift(self, estimated: int, actual: int) -> float | None:
+        if estimated <= 0 or actual <= 0:
+            return None
+        ratio = actual / estimated
+        self.token_drift_samples.append(round(ratio, 4))
+        if len(self.token_drift_samples) > 50:
+            del self.token_drift_samples[:-50]
+        return ratio
+
+    @property
+    def median_token_drift(self) -> float | None:
+        if not self.token_drift_samples:
+            return None
+        return statistics.median(self.token_drift_samples)
+
     def touch(self) -> None:
         self.updated_at = _now()
 
@@ -184,6 +205,9 @@ class SessionLedger(BaseModel):
             "updated_at": self.updated_at.isoformat(),
             "turns_seen": self.turns_seen,
             "compactions": self.compaction_count,
+            "token_drift_median": (
+                round(self.median_token_drift, 3) if self.median_token_drift else None
+            ),
             "tokens_saved": self.total_tokens_saved,
             "folded_through": self.folded_through,
             "summary_chars": len(self.summary),

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 
 import httpx
 
@@ -70,6 +70,7 @@ class Backend(ABC):
         upstream_model: str,
         client_headers: Mapping[str, str],
         input_tokens: int = 0,
+        on_usage: Callable[[int], None] | None = None,  # noqa: ARG002
     ) -> AsyncIterator[bytes]:
         """Streaming call. Yields Anthropic-shaped SSE bytes."""
 

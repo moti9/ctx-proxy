@@ -8,6 +8,7 @@ from .backends import Backend, BackendRegistry
 from .config import Config, ModelProfile
 from .context.manager import ContextManager
 from .context.summarizer import Summarizer
+from .store.archive import FoldArchive
 from .store.file import FileLedgerStore
 from .tokens.base import TokenCounter, build_counter
 from .tokens.upstream import UpstreamCounter
@@ -21,7 +22,8 @@ class AppState:
         self.config = config
         self.registry = BackendRegistry(config.backends)
         self.store = FileLedgerStore(config.server.state_dir)
-        self.manager = ContextManager(config, self.store)
+        self.archive = FoldArchive(config.server.state_dir / "archive")
+        self.manager = ContextManager(config, self.store, self.archive)
 
         # Counters hold a memo cache keyed by block content, so they must
         # outlive a single request — that cache is what keeps token counting

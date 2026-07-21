@@ -19,6 +19,7 @@ import logging
 
 from ..config import Config, ModelProfile
 from ..logging import log_event
+from ..store.archive import FoldArchive
 from ..store.base import LedgerStore
 from ..tokens.base import TokenCounter
 from ..types_anthropic import Message, MessagesRequest, ReductionResult
@@ -32,9 +33,12 @@ log = logging.getLogger(__name__)
 
 
 class ContextManager:
-    def __init__(self, config: Config, store: LedgerStore) -> None:
+    def __init__(
+        self, config: Config, store: LedgerStore, archive: FoldArchive | None = None
+    ) -> None:
         self.config = config
         self.store = store
+        self.archive = archive
         self._strategies = build_strategies(config.policy)
 
     async def process(
@@ -141,6 +145,29 @@ class ContextManager:
 
         if ctx.new_fold:
             start, end = ctx.new_fold
+            # Archive the raw span BEFORE recording the fold: after this the
+            # originals never appear in a request again.
+            if self.archive is not None and ctx.folded_span:
+                try:
+                    await self.archive.append(
+                        session_key,
+                        span=ctx.folded_span,
+                        start=start,
+                        end=end,
+                        summary=ledger.summary,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    # Archiving is a debugging aid, not part of serving the
+                    # request. FoldArchive guards itself, but the manager must
+                    # not depend on any particular implementation doing so —
+                    # losing the archive is bad, failing the turn is worse.
+                    log_event(
+                        log,
+                        "could not archive folded span",
+                        level=logging.WARNING,
+                        session=session_key,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
             ledger.record_fold(
                 original_messages, start=start, end=end, summary=ledger.summary
             )

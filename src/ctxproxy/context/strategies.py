@@ -57,6 +57,8 @@ class ReductionContext:
     to_original: Callable[[int], int] = lambda i: i
     # Set by ``compact`` so the manager can persist the new watermark.
     new_fold: tuple[int, int] | None = None
+    # The raw messages compact folded away — archived before they are lost.
+    folded_span: list[Message] | None = None
     # Working index at which a previously folded summary sits, if spliced.
     fold_anchor: int | None = None
 
@@ -284,6 +286,7 @@ class Compact:
         original_start = ctx.to_original(start)
         original_end = ctx.to_original(cut)
         ctx.new_fold = (original_start, original_end)
+        ctx.folded_span = span
 
         ctx.ledger.summary = summary_text
         ctx.ledger.note_files(_extract_paths(span))

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from conftest import (
     assistant,
@@ -307,3 +309,71 @@ async def test_dropped_anchors_are_reattached_to_the_summary():
     assert "src/mod_0.py" in summary, "file path must survive the summariser"
     assert "PermissionError" in summary, "error text must survive the summariser"
     assert "preserved verbatim" in summary
+
+
+async def test_folded_messages_are_archived_before_being_lost(config, tmp_path, counter):
+    """Compaction is the one irreversible step; the raw span must be recoverable."""
+    from ctxproxy.store.archive import FoldArchive
+
+    archive = FoldArchive(tmp_path / "archive")
+    mgr = ContextManager(config, FileLedgerStore(tmp_path / "sessions"), archive)
+    profile = config.profile_for("our-coder")
+
+    request = make_request(build_text_heavy_conversation(turns=30, size=3000))
+    _, ledger = await mgr.process(
+        request,
+        profile=profile,
+        session_key="arch1",
+        counter=counter,
+        summarizer=FakeSummarizer(),
+    )
+    assert ledger.has_fold
+
+    entries = archive.read("arch1")
+    assert entries, "fold must be archived"
+    assert entries[0]["message_count"] > 0
+    assert entries[0]["original_range"][1] == ledger.folded_through
+    # The originals must be recoverable verbatim, not just summarised.
+    dumped = json.dumps(entries[0]["messages"])
+    assert "idempotency" in dumped or "Step 0" in dumped
+
+
+async def test_archive_failure_never_breaks_a_request(config, tmp_path, counter):
+    class ExplodingArchive:
+        async def append(self, *a, **kw):
+            raise OSError("disk full")
+
+    mgr = ContextManager(config, FileLedgerStore(tmp_path / "s"), ExplodingArchive())
+    request = make_request(build_text_heavy_conversation(turns=30, size=3000))
+    result, _ = await mgr.process(
+        request,
+        profile=config.profile_for("our-coder"),
+        session_key="arch2",
+        counter=counter,
+        summarizer=FakeSummarizer(),
+    )
+    assert result.triggered
+
+
+def test_token_drift_flags_undercounting():
+    ledger = SessionLedger(session_key="d")
+    for _ in range(6):
+        ledger.record_token_drift(estimated=1000, actual=1250)
+    assert ledger.median_token_drift == 1.25, "must detect that we count 25% low"
+    assert ledger.stats()["token_drift_median"] == 1.25
+
+
+def test_token_drift_ignores_nonsense_samples():
+    ledger = SessionLedger(session_key="d")
+    assert ledger.record_token_drift(0, 100) is None
+    assert ledger.record_token_drift(100, 0) is None
+    assert ledger.median_token_drift is None
+
+
+def test_drift_ignores_small_requests():
+    """Fixed chat-template overhead swamps the ratio on tiny prompts."""
+    from ctxproxy.routes import _MIN_TOKENS_FOR_DRIFT
+
+    assert _MIN_TOKENS_FOR_DRIFT >= 1000, (
+        "threshold must be high enough that per-request overhead is negligible"
+    )

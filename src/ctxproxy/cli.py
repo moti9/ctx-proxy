@@ -185,12 +185,24 @@ def sessions(
         typer.echo("No sessions recorded yet.")
         return
 
-    typer.echo(f"{'SESSION':<30} {'TURNS':>6} {'COMPACT':>8} {'SAVED':>10}  UPDATED")
+    typer.echo(
+        f"{'SESSION':<28} {'TURNS':>6} {'COMPACT':>8} {'SAVED':>10} {'DRIFT':>7}  UPDATED"
+    )
     for ledger in ledgers[:limit]:
+        drift = ledger.median_token_drift
+        drift_col = f"{drift:.2f}x" if drift else "-"
         typer.echo(
-            f"{ledger.session_key[:30]:<30} {ledger.turns_seen:>6} "
-            f"{ledger.compaction_count:>8} {ledger.total_tokens_saved:>10}  "
-            f"{ledger.updated_at:%Y-%m-%d %H:%M}"
+            f"{ledger.session_key[:28]:<28} {ledger.turns_seen:>6} "
+            f"{ledger.compaction_count:>8} {ledger.total_tokens_saved:>10} "
+            f"{drift_col:>7}  {ledger.updated_at:%Y-%m-%d %H:%M}"
+        )
+
+    worst = [item.median_token_drift for item in ledgers if item.median_token_drift]
+    if worst and max(worst) > 1.10:
+        typer.secho(
+            f"\nDRIFT > 1.10x: token estimates run low, so compaction fires late. "
+            f"Raise tokenizer.safety_multiplier to about {max(worst) * 1.05:.2f}.",
+            fg=typer.colors.YELLOW,
         )
 
     total = sum(item.total_tokens_saved for item in ledgers)
@@ -221,6 +233,46 @@ def inspect(
 
 
 @app.command()
+def archive(
+    session_key: str = typer.Argument(..., help="Session key (see `ctxproxy sessions`)"),
+    config_path: Path = ConfigOpt,
+    show: int = typer.Option(0, help="Print the first N messages of each fold"),
+) -> None:
+    """Show the raw messages compaction folded away.
+
+    The summary is what the model sees; this is what it was made from. Use it
+    when a session behaves as though it forgot something.
+    """
+    configure("warning", "text")
+    config = _load(config_path)
+
+    from .store.archive import FoldArchive
+
+    entries = FoldArchive(config.server.state_dir / "archive").read(session_key)
+    if not entries:
+        typer.echo(f"No archived folds for {session_key!r}.")
+        typer.echo("Either it never compacted, or state was reset.")
+        return
+
+    for i, entry in enumerate(entries, 1):
+        lo, hi = entry["original_range"]
+        typer.secho(
+            f"\nFold {i}: original messages [{lo}:{hi}] "
+            f"({entry['message_count']} messages) at {entry['archived_at']}",
+            bold=True,
+        )
+        for msg in entry["messages"][:show]:
+            content = msg.get("content")
+            text = content if isinstance(content, str) else json.dumps(content)[:300]
+            typer.echo(f"  [{msg.get('role')}] {text[:300]}")
+
+    total = sum(e["message_count"] for e in entries)
+    typer.echo(f"\n{len(entries)} fold(s), {total} messages archived.")
+    if not show:
+        typer.echo("Pass --show N to print message bodies.")
+
+
+@app.command()
 def reset(
     session_key: str = typer.Argument(None, help="Session to clear; omit for all"),
     config_path: Path = ConfigOpt,
@@ -232,15 +284,21 @@ def reset(
     from .store.file import FileLedgerStore
 
     store = FileLedgerStore(config.server.state_dir)
+    archive_dir = config.server.state_dir / "archive"
     if session_key:
         removed = asyncio.run(store.delete(session_key))
+        safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in session_key)[:120]
+        (archive_dir / f"{safe}.jsonl").unlink(missing_ok=True)
         typer.echo("Deleted." if removed else "No such session.")
     else:
         typer.confirm(f"Delete all ledgers in {store.directory}?", abort=True)
         count = len(list(store.directory.glob("*.json")))
         for path in store.directory.glob("*.json"):
             path.unlink()
-        typer.echo(f"Deleted {count} ledger(s).")
+        if archive_dir.is_dir():
+            for path in archive_dir.glob("*.jsonl"):
+                path.unlink()
+        typer.echo(f"Deleted {count} ledger(s) and their archives.")
 
 
 @app.command()
