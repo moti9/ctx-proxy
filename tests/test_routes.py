@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 import respx
@@ -227,3 +229,34 @@ def test_stats_endpoint_reports_sessions(client):
 
     payload = client.get("/stats").json()
     assert payload["sessions"] >= 1
+
+
+def test_extra_params_are_merged_into_the_upstream_payload(config):
+    config.backend("internal").openai_extra_params = {"reasoning_effort": "low"}
+    with TestClient(create_app(config)) as client, respx.mock:
+        route = respx.post(OPENAI_URL).mock(
+            return_value=httpx.Response(200, json=chat_completion())
+        )
+        client.post("/v1/messages", json=body())
+
+    sent = json.loads(route.calls[0].request.content)
+    assert sent["reasoning_effort"] == "low"
+
+
+def test_extra_params_cannot_clobber_proxy_owned_fields(config):
+    """A stray `messages` override would silently send the wrong conversation."""
+    config.backend("internal").openai_extra_params = {
+        "messages": [{"role": "user", "content": "hijacked"}],
+        "model": "wrong-model",
+        "temperature": 0.1,
+    }
+    with TestClient(create_app(config)) as client, respx.mock:
+        route = respx.post(OPENAI_URL).mock(
+            return_value=httpx.Response(200, json=chat_completion())
+        )
+        client.post("/v1/messages", json=body())
+
+    sent = json.loads(route.calls[0].request.content)
+    assert sent["model"] == "internal-coder-v2"
+    assert "hijacked" not in json.dumps(sent["messages"])
+    assert sent["temperature"] == 0.1

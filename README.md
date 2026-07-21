@@ -182,6 +182,67 @@ translated and stripped.
 writing summaries with a strong one is usually the right trade — a bad summary
 poisons every subsequent turn.
 
+### Reasoning models
+
+Models like kimi-k2, DeepSeek-R1 and QwQ return their chain of thought in a
+separate `reasoning_content` field. Anthropic has no client-visible equivalent,
+so the proxy decides what becomes of it:
+
+```yaml
+backends:
+  - name: internal
+    openai_reasoning_output: thinking   # thinking | text | drop
+```
+
+| Mode | Effect |
+|---|---|
+| `thinking` | Anthropic `thinking` blocks — client shows collapsed reasoning. **Default.** |
+| `text` | Inline with the answer. Visible, but noisy. |
+| `drop` | Cleanest transcript, but the client sees nothing while the model reasons. |
+
+This is a latency decision as much as a cosmetic one. Measured against a model
+that reasons for several seconds before answering: `drop` gave **4867ms** to
+first visible output, `thinking` gives **~200ms**. Suppressing reasoning means
+suppressing *all* output during that window, which reads as the proxy hanging.
+
+Whatever the setting, reasoning is still surfaced if a turn would otherwise be
+empty — some models leave `content` empty and put the answer in
+`reasoning_content`, so no setting can silence a response.
+
+### Output caps
+
+`max_output_tokens` is a hard ceiling separate from the context window. Claude
+Code routinely asks for 32K+, and a backend capped lower **rejects the request
+outright rather than clamping**. Set it whenever your model advertises one:
+
+```yaml
+context_window: 262144      # what fits going in
+max_output_tokens: 31000    # what the backend will actually generate
+```
+
+### Retention
+
+State lives under `server.state_dir` (default `~/.ctxproxy/sessions/`):
+
+| What | Size | Read when |
+|---|---|---|
+| Ledgers `<session>.json` | ~1–30 KB | **Every request** — kept deliberately small |
+| Archives `archive/<session>.jsonl` | up to `archive_max_mb` | Only by you, via `ctxproxy archive` |
+
+```yaml
+session_ttl_hours: 720       # ledgers — small, keep them a month
+archive_ttl_hours: 168       # archives — large; omit to reuse session_ttl_hours
+prune_interval_hours: 6      # sweep while running; 0 = startup only
+archive_max_mb: 25           # per-session cap, oldest folds dropped first
+```
+
+Worth keeping these apart. Ledgers are kilobytes and stay useful for the life of
+a session; archives are whole transcripts and are almost only ever read while
+debugging something recent, so a long ledger TTL should not drag them along.
+
+Worst case is `archive_max_mb` x sessions that compacted inside the **archive**
+window. Set `archive_max_mb: 0` to disable archiving entirely if disk is tight.
+
 ### Policy
 
 ```yaml
@@ -223,7 +284,8 @@ ctxproxy serve --reload      # restart on source *or* ctxproxy.yaml change
 ctxproxy doctor              # validate config, probe backends
 ctxproxy sessions            # what compaction has saved, per session
 ctxproxy inspect <key>       # a session's rolling summary — what survived
-ctxproxy reset [<key>]       # clear session state
+ctxproxy archive <key>       # the raw messages compaction folded away
+ctxproxy reset [<key>]       # clear session state (ledger + archive)
 curl localhost:4000/health   # profiles and backends
 curl localhost:4000/stats    # aggregate savings
 ```
@@ -237,6 +299,30 @@ applied compact  session=sess-A saved=23693 tokens=2714 detail=folded working[1:
 ```
 
 Set `log_format: json` for machine-readable output.
+
+### When a session seems to have forgotten something
+
+`ctxproxy inspect` shows what the model can still see; `ctxproxy archive` shows
+what was removed to get there. Comparing the two is the fastest way to tell a
+summariser problem from a model problem.
+
+### Tokenizer drift
+
+Local token counting is an approximation — `cl100k` is not the tokenizer most
+non-Anthropic models use, and **under-counting is the dangerous direction**: it
+delays compaction until the request no longer fits the real window.
+
+The proxy compares its estimate against the backend's reported `prompt_tokens`
+and tracks a rolling median per session, shown in `ctxproxy sessions`:
+
+```
+SESSION                       TURNS  COMPACT      SAVED   DRIFT  UPDATED
+```
+
+Above `1.10x` it warns with a concrete `safety_multiplier` to set. Two things
+worth knowing: samples under 5000 tokens are ignored (backends add fixed
+chat-template overhead that swamps the ratio on small prompts), so **`DRIFT`
+stays `-` until you have genuinely large turns** — that is correct, not broken.
 
 ---
 
@@ -300,7 +386,7 @@ ctxproxy owns context.
 
 ```bash
 uv pip install -e ".[dev,tokenizers]"
-pytest -q          # 89 tests
+pytest -q          # 105 tests
 ruff check src tests
 ```
 

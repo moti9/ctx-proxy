@@ -52,13 +52,28 @@ class BackendConfig(BaseModel):
     # mentioning `stream_options`.
     openai_stream_usage: bool = True
 
-    # What to do with `reasoning_content` from reasoning models. Anthropic has
-    # no client-visible equivalent on a translated response, so the choice is
-    # between rendering it as text (noisy — the whole chain of thought lands in
-    # the transcript) and discarding it. "text" is the default because some
-    # models leave `content` empty and put the answer in `reasoning_content`;
-    # dropping it there would lose the response entirely.
-    openai_reasoning_output: Literal["text", "drop"] = "text"
+    # What to do with `reasoning_content` from reasoning models.
+    #
+    #   thinking  emit as Anthropic `thinking` blocks. The client renders them
+    #             as collapsed reasoning rather than answer text, so the user
+    #             sees progress immediately without polluting the transcript.
+    #             Best default for reasoning models.
+    #   text      emit as ordinary text blocks. Visible immediately, but the
+    #             chain of thought lands inline with the answer.
+    #   drop      discard. Cleanest transcript, but the client sees nothing at
+    #             all while the model reasons — on a model that reasons for
+    #             several seconds this reads as the proxy hanging.
+    #
+    # Whatever the setting, reasoning is still shown if a turn would otherwise
+    # be empty: some models leave `content` empty and put the answer here.
+    openai_reasoning_output: Literal["thinking", "text", "drop"] = "thinking"
+
+    # Merged into every outgoing chat-completions payload. The escape hatch for
+    # backend-specific knobs the Anthropic request shape has nowhere to put —
+    # most usefully `reasoning_effort`, which on a reasoning model is the single
+    # biggest lever on latency. Check the model's `supported_openai_params`
+    # before adding anything; unknown fields make strict gateways 400.
+    openai_extra_params: dict[str, Any] = Field(default_factory=dict)
 
     def resolve_api_key(self) -> str | None:
         if self.api_key:
@@ -208,8 +223,33 @@ class ServerConfig(BaseModel):
     # Where session ledgers live.
     state_dir: Path = Field(default_factory=lambda: Path.home() / ".ctxproxy" / "sessions")
 
-    # Ledgers untouched for this long are pruned at startup.
+    # Ledgers and archives untouched for this long are deleted.
     session_ttl_hours: int = 72
+
+    # How often to re-run retention while the server is up. Startup-only
+    # pruning is not enough for a proxy that stays running for weeks.
+    # 0 disables the periodic sweep (startup still prunes).
+    prune_interval_hours: int = 6
+
+    # How long to keep raw fold archives. Unset means "same as the ledger".
+    # Worth setting shorter than session_ttl_hours: ledgers are kilobytes
+    # and stay useful for the life of a session, whereas archives are whole
+    # transcripts and are almost only ever read while debugging something
+    # recent.
+    archive_ttl_hours: int | None = None
+
+    # Per-session cap on the raw fold archive. Archives hold full
+    # transcripts, so they are far larger than ledgers; when a session
+    # exceeds this the oldest folds are dropped first.
+    archive_max_mb: int = 25
+
+    @property
+    def effective_archive_ttl_hours(self) -> int:
+        return (
+            self.archive_ttl_hours
+            if self.archive_ttl_hours is not None
+            else self.session_ttl_hours
+        )
 
 
 class Config(BaseModel):

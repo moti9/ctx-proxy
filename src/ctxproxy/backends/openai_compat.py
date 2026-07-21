@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 
 import httpx
 
@@ -16,6 +16,9 @@ from ..types_anthropic import MessagesRequest
 from .base import Backend
 
 log = logging.getLogger(__name__)
+
+# Fields the proxy owns; openai_extra_params must not overwrite them.
+_RESERVED = frozenset({"model", "messages", "stream", "tools"})
 
 
 class OpenAICompatBackend(Backend):
@@ -39,6 +42,7 @@ class OpenAICompatBackend(Backend):
             max_tokens_field=self.config.openai_max_tokens_field,
             include_usage=False,
         )
+        payload = self._with_extra_params(payload)
         data = await self._post_json(
             "/v1/chat/completions", payload, self._headers(client_headers)
         )
@@ -69,6 +73,7 @@ class OpenAICompatBackend(Backend):
         upstream_model: str,
         client_headers: Mapping[str, str],
         input_tokens: int = 0,
+        on_usage: Callable[[int], None] | None = None,
     ) -> AsyncIterator[bytes]:
         payload = anthropic_to_openai(
             request,
@@ -76,6 +81,7 @@ class OpenAICompatBackend(Backend):
             max_tokens_field=self.config.openai_max_tokens_field,
             include_usage=self.config.openai_stream_usage,
         )
+        payload = self._with_extra_params(payload)
         headers = self._headers(client_headers)
         headers["accept"] = "text/event-stream"
 
@@ -109,6 +115,11 @@ class OpenAICompatBackend(Backend):
                 for event in translator.finish():
                     yield event
 
+                # Claude Code streams almost everything, so this is where
+                # token-drift samples actually come from.
+                if on_usage and translator.upstream_input_tokens:
+                    on_usage(translator.upstream_input_tokens)
+
         except UpstreamError:
             raise
         except httpx.RequestError as exc:
@@ -125,6 +136,18 @@ class OpenAICompatBackend(Backend):
             f"backend {self.name!r} is OpenAI-compatible and has no count_tokens "
             f"endpoint; set supports_count_tokens: false on the profile"
         )
+
+    def _with_extra_params(self, payload: dict) -> dict:
+        extra = self.config.openai_extra_params
+        if not extra:
+            return payload
+        if clobbered := _RESERVED & extra.keys():
+            log.warning(
+                "backend %s: ignoring openai_extra_params %s — the proxy owns those fields",
+                self.name,
+                sorted(clobbered),
+            )
+        return {**payload, **{k: v for k, v in extra.items() if k not in _RESERVED}}
 
     def _headers(self, client_headers: Mapping[str, str]) -> dict[str, str]:
         headers = self._forwarded_headers(client_headers)

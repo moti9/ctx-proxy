@@ -16,6 +16,7 @@ Two properties matter more than summary quality here:
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Awaitable, Callable
 
 from ..config import ModelProfile
@@ -107,7 +108,8 @@ class Summarizer:
 
         for chunk in chunks:
             summary = await self._fold_once(summary, chunk, ledger)
-        return summary
+
+        return _preserve_anchors(summary, span)
 
     async def _fold_once(self, prior: str, transcript: str, ledger: SessionLedger) -> str:
         sections = []
@@ -191,3 +193,80 @@ def render_span(span: list[Message]) -> str:
 
 
 __all__ = ["Summarizer", "render_span", "message_text"]
+
+
+# --------------------------------------------------------------------------- #
+# Anchor preservation
+# --------------------------------------------------------------------------- #
+
+_ANCHOR_PATH_RE = re.compile(r"(?:^|[\s\"'`(\[])(/?(?:[\w.-]+/){1,}[\w.-]+\.\w{1,8})")
+_MAX_ANCHORS = 60
+
+
+def _extract_anchors(span: list[Message]) -> list[str]:
+    """Concrete identifiers whose loss would cause a wrong answer later.
+
+    Prose can be re-worded harmlessly; a dropped file path or error string
+    cannot. These are exactly the facts a model will otherwise confabulate,
+    because it knows the work happened but no longer has the specifics.
+    """
+    paths: list[str] = []
+    errors: list[str] = []
+
+    for msg in span:
+        for block in msg.blocks():
+            btype = block.get("type")
+            if btype == "tool_use":
+                for value in _walk_strings(block.get("input")):
+                    paths.extend(_ANCHOR_PATH_RE.findall(value))
+            elif btype == "tool_result" and block.get("is_error"):
+                text = " ".join(block_text(block).split())
+                if text:
+                    errors.append(text[:200])
+            elif btype == "text":
+                paths.extend(_ANCHOR_PATH_RE.findall(block.get("text") or ""))
+
+    out: list[str] = []
+    for item in [*dict.fromkeys(paths), *dict.fromkeys(errors)]:
+        if item not in out:
+            out.append(item)
+    return out[:_MAX_ANCHORS]
+
+
+def _preserve_anchors(summary: str, span: list[Message]) -> str:
+    """Append anchors the summariser dropped.
+
+    The summariser is asked to keep identifiers verbatim, but that is an
+    instruction, not a guarantee — and a weaker summariser model will silently
+    generalise them away. Re-attaching the missing ones mechanically turns
+    "usually preserved" into "always present", at the cost of a few tokens.
+    """
+    anchors = _extract_anchors(span)
+    if not anchors:
+        return summary
+
+    missing = [a for a in anchors if a not in summary]
+    if not missing:
+        return summary
+
+    log.info(
+        "summary dropped %d/%d anchor(s); re-attaching verbatim",
+        len(missing),
+        len(anchors),
+    )
+    lines = "\n".join(f"- {a}" for a in missing)
+    return (
+        f"{summary}\n\n## Referenced earlier (preserved verbatim)\n"
+        f"These appeared in the compacted transcript. Re-read or re-run as "
+        f"needed rather than assuming their contents.\n{lines}"
+    )
+
+
+def _walk_strings(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [s for v in value.values() for s in _walk_strings(v)]
+    if isinstance(value, list):
+        return [s for v in value for s in _walk_strings(v)]
+    return []

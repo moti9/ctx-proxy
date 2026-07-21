@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from conftest import (
     assistant,
@@ -12,6 +14,7 @@ from conftest import (
     user,
 )
 
+from ctxproxy.context.ledger import SessionLedger
 from ctxproxy.context.manager import ContextManager
 from ctxproxy.store.file import FileLedgerStore
 from ctxproxy.tokens.local import HeuristicCounter
@@ -264,3 +267,164 @@ async def test_max_tokens_below_the_ceiling_is_left_alone(
     request = make_request(build_conversation(1, 50), max_tokens=4_096)
     await run(manager, request, openai_profile, counter, FakeSummarizer())
     assert request.max_tokens == 4_096
+
+
+async def test_cleared_tool_result_names_the_call_and_says_to_re_run(
+    manager, openai_profile, counter
+):
+    """A bare placeholder invites the model to confabulate the missing output."""
+    request = make_request(build_conversation(exchanges=20, payload_size=4000))
+    await run(manager, request, openai_profile, counter, FakeSummarizer())
+
+    cleared = [
+        b.get("content", "")
+        for m in request.messages
+        for b in m.blocks()
+        if b.get("type") == "tool_result" and str(b.get("content", "")).startswith("[cleared")
+    ]
+    assert cleared, "expected at least one cleared tool result"
+    sample = cleared[0]
+    assert "read_file" in sample, "placeholder must name the call that produced it"
+    assert "src/mod_" in sample, "placeholder must carry the call's arguments"
+    assert "do not" in sample.lower() and "memory" in sample.lower()
+
+
+async def test_dropped_anchors_are_reattached_to_the_summary():
+    """A weak summariser silently generalises identifiers away; we re-attach them."""
+    from ctxproxy.config import ModelProfile
+    from ctxproxy.context.summarizer import Summarizer
+
+    async def lazy_summariser(request):
+        return "## State\nDid some work on the payments code."   # drops every path
+
+    profile = ModelProfile(match="s", backend="internal", context_window=32000)
+    summarizer = Summarizer(lazy_summariser, profile)
+
+    span = build_conversation(exchanges=4, payload_size=100)
+    span.append(tool_result("toolu_x", "PermissionError: /etc/secrets denied", True))
+    ledger = SessionLedger(session_key="k")
+
+    summary = await summarizer.fold(span, ledger)
+
+    assert "src/mod_0.py" in summary, "file path must survive the summariser"
+    assert "PermissionError" in summary, "error text must survive the summariser"
+    assert "preserved verbatim" in summary
+
+
+async def test_folded_messages_are_archived_before_being_lost(config, tmp_path, counter):
+    """Compaction is the one irreversible step; the raw span must be recoverable."""
+    from ctxproxy.store.archive import FoldArchive
+
+    archive = FoldArchive(tmp_path / "archive")
+    mgr = ContextManager(config, FileLedgerStore(tmp_path / "sessions"), archive)
+    profile = config.profile_for("our-coder")
+
+    request = make_request(build_text_heavy_conversation(turns=30, size=3000))
+    _, ledger = await mgr.process(
+        request,
+        profile=profile,
+        session_key="arch1",
+        counter=counter,
+        summarizer=FakeSummarizer(),
+    )
+    assert ledger.has_fold
+
+    entries = archive.read("arch1")
+    assert entries, "fold must be archived"
+    assert entries[0]["message_count"] > 0
+    assert entries[0]["original_range"][1] == ledger.folded_through
+    # The originals must be recoverable verbatim, not just summarised.
+    dumped = json.dumps(entries[0]["messages"])
+    assert "idempotency" in dumped or "Step 0" in dumped
+
+
+async def test_archive_failure_never_breaks_a_request(config, tmp_path, counter):
+    class ExplodingArchive:
+        async def append(self, *a, **kw):
+            raise OSError("disk full")
+
+    mgr = ContextManager(config, FileLedgerStore(tmp_path / "s"), ExplodingArchive())
+    request = make_request(build_text_heavy_conversation(turns=30, size=3000))
+    result, _ = await mgr.process(
+        request,
+        profile=config.profile_for("our-coder"),
+        session_key="arch2",
+        counter=counter,
+        summarizer=FakeSummarizer(),
+    )
+    assert result.triggered
+
+
+def test_token_drift_flags_undercounting():
+    ledger = SessionLedger(session_key="d")
+    for _ in range(6):
+        ledger.record_token_drift(estimated=1000, actual=1250)
+    assert ledger.median_token_drift == 1.25, "must detect that we count 25% low"
+    assert ledger.stats()["token_drift_median"] == 1.25
+
+
+def test_token_drift_ignores_nonsense_samples():
+    ledger = SessionLedger(session_key="d")
+    assert ledger.record_token_drift(0, 100) is None
+    assert ledger.record_token_drift(100, 0) is None
+    assert ledger.median_token_drift is None
+
+
+def test_drift_ignores_small_requests():
+    """Fixed chat-template overhead swamps the ratio on tiny prompts."""
+    from ctxproxy.routes import _MIN_TOKENS_FOR_DRIFT
+
+    assert _MIN_TOKENS_FOR_DRIFT >= 1000, (
+        "threshold must be high enough that per-request overhead is negligible"
+    )
+
+
+async def test_archive_enforces_a_size_cap(tmp_path):
+    """A long session must not grow its archive without bound."""
+    from ctxproxy.store.archive import FoldArchive
+
+    archive = FoldArchive(tmp_path / "arch", max_mb=1)
+    span = build_conversation(exchanges=6, payload_size=20_000)  # ~big fold
+
+    for _ in range(12):
+        await archive.append("big", span=span, start=0, end=len(span), summary="s")
+
+    path = tmp_path / "arch" / "big.jsonl"
+    size_mb = path.stat().st_size / (1024 * 1024)
+    assert size_mb <= 1.0, f"archive grew to {size_mb:.2f} MB despite a 1 MB cap"
+
+    entries = archive.read("big")
+    assert entries, "trimming must keep the most recent folds, not wipe the file"
+
+
+async def test_archive_prune_removes_expired_files(tmp_path):
+    import os
+    import time
+
+    from ctxproxy.store.archive import FoldArchive
+
+    archive = FoldArchive(tmp_path / "arch")
+    await archive.append("old", span=[user("x")], start=0, end=1, summary="s")
+
+    path = tmp_path / "arch" / "old.jsonl"
+    stale = time.time() - 100 * 3600
+    os.utime(path, (stale, stale))
+
+    assert archive.prune(ttl_hours=72) == 1
+    assert not path.exists()
+    assert archive.prune(ttl_hours=0) == 0, "ttl 0 must disable pruning"
+
+
+def test_archive_ttl_defaults_to_the_ledger_ttl():
+    from ctxproxy.config import ServerConfig
+
+    assert ServerConfig(session_ttl_hours=720).effective_archive_ttl_hours == 720
+
+
+def test_archive_ttl_can_be_shorter_than_the_ledger_ttl():
+    """Ledgers are kilobytes; archives are whole transcripts."""
+    from ctxproxy.config import ServerConfig
+
+    cfg = ServerConfig(session_ttl_hours=720, archive_ttl_hours=168)
+    assert cfg.session_ttl_hours == 720
+    assert cfg.effective_archive_ttl_hours == 168
