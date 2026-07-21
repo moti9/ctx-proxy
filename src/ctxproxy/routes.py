@@ -72,6 +72,19 @@ async def create_message(http_request: Request):
     prepared = _prepare(result.request, profile)
     policy = state.config.policy
 
+    if session.source == "fingerprint" and _first_sighting(state, session.value):
+        # Header-based identity is exact; the fingerprint is a fallback. Say so
+        # once per session so a silently-missing header is visible rather than
+        # something you discover from a lost rolling summary hours later.
+        log_event(
+            log,
+            "no session header; identifying by conversation fingerprint",
+            session=session.value,
+            seen_headers=sorted(
+                h for h in http_request.headers if "session" in h.lower() or "agent" in h.lower()
+            ) or ["none"],
+        )
+
     log_event(
         log,
         "dispatch",
@@ -233,6 +246,16 @@ async def models(http_request: Request):
 
 
 # --------------------------------------------------------------------------- #
+
+
+def _first_sighting(state, session_key: str) -> bool:
+    seen = getattr(state, "_seen_sessions", None)
+    if seen is None:
+        seen = state._seen_sessions = set()
+    if session_key in seen:
+        return False
+    seen.add(session_key)
+    return True
 
 
 async def _record_drift(state, session_key: str, estimated: int, payload: dict) -> None:

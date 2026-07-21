@@ -54,3 +54,29 @@ def test_fingerprint_differs_across_models():
     a = derive_session_key({}, make_request(list(messages), model="our-coder"))
     b = derive_session_key({}, make_request(list(messages), model="claude-opus-4-8"))
     assert a.value != b.value
+
+
+def test_fingerprint_survives_a_changing_system_prompt():
+    """Claude Code rebuilds its system prompt every turn with volatile content.
+
+    Including it made the key drift mid-conversation, orphaning the ledger and
+    forcing a re-compaction from scratch.
+    """
+    messages = build_conversation(exchanges=3)
+    turn1 = derive_session_key(
+        {}, make_request(list(messages), system="cwd=/a git=clean 10:00")
+    )
+    turn2 = derive_session_key(
+        {}, make_request(list(messages), system="cwd=/a git=dirty 10:42 branch=beta")
+    )
+    assert turn1.value == turn2.value
+
+
+def test_fingerprint_survives_tool_results_arriving_first():
+    """A resumed conversation can open with a tool_result carrier."""
+    from conftest import assistant_tool_call, tool_result
+
+    base = [user("refactor billing"), assistant_tool_call("t1"), tool_result("t1", "data")]
+    a = derive_session_key({}, make_request(list(base)))
+    b = derive_session_key({}, make_request(base + [assistant("done"), user("next")]))
+    assert a.value == b.value
