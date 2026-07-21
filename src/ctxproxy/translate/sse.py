@@ -38,13 +38,14 @@ class OpenAIStreamTranslator:
     model: str
     message_id: str = "msg_ctxproxy"
     input_tokens: int = 0
-    reasoning_output: str = "text"
+    reasoning_output: str = "thinking"
 
     _started: bool = False
     _finished: bool = False
     _next_index: int = 0
     _open_index: int | None = None
     _text_index: int | None = None
+    _thinking_index: int | None = None
     _tools: dict[int, _ToolBlock] = field(default_factory=dict)
     _stop_reason: str = "end_turn"
     _output_tokens: int = 0
@@ -101,10 +102,15 @@ class OpenAIStreamTranslator:
         if reason := choice.get("finish_reason"):
             self._stop_reason = FINISH_REASON_MAP.get(reason, "end_turn")
 
-        # Reasoning-model preamble. Rendered as text, or buffered and dropped.
+        # Reasoning-model preamble. Streaming this through as it arrives is
+        # what keeps time-to-first-token low: a model that reasons for several
+        # seconds before answering otherwise leaves the client blank that whole
+        # time, which reads as the proxy hanging.
         for key in ("reasoning_content", "reasoning"):
             if value := delta.get(key):
-                if self.reasoning_output == "text":
+                if self.reasoning_output == "thinking":
+                    out.extend(self._thinking_delta(str(value)))
+                elif self.reasoning_output == "text":
                     out.extend(self._text_delta(str(value)))
                 else:
                     # Held rather than discarded: if the turn produces nothing
@@ -160,30 +166,53 @@ class OpenAIStreamTranslator:
     # -- block management --------------------------------------------------- #
 
     def _text_delta(self, text: str) -> list[bytes]:
+        return self._typed_delta("text", text)
+
+    def _thinking_delta(self, text: str) -> list[bytes]:
+        return self._typed_delta("thinking", text)
+
+    def _typed_delta(self, kind: str, text: str) -> list[bytes]:
+        """Append to the open block of ``kind``, opening one if needed.
+
+        Text and thinking get separate block indices and are never merged —
+        switching between them closes the current block first, because
+        Anthropic allows exactly one open content block at a time.
+        """
         out: list[bytes] = []
-        if self._text_index is None or self._open_index != self._text_index:
+        attr = "_text_index" if kind == "text" else "_thinking_index"
+        index = getattr(self, attr)
+
+        if index is None or self._open_index != index:
             out.extend(self._close_open_block())
-            self._text_index = self._next_index
+            index = self._next_index
             self._next_index += 1
-            self._open_index = self._text_index
+            setattr(self, attr, index)
+            self._open_index = index
+            opening = (
+                {"type": "text", "text": ""}
+                if kind == "text"
+                else {"type": "thinking", "thinking": ""}
+            )
             out.append(
                 sse_event(
                     "content_block_start",
                     {
                         "type": "content_block_start",
-                        "index": self._text_index,
-                        "content_block": {"type": "text", "text": ""},
+                        "index": index,
+                        "content_block": opening,
                     },
                 )
             )
+
+        delta = (
+            {"type": "text_delta", "text": text}
+            if kind == "text"
+            else {"type": "thinking_delta", "thinking": text}
+        )
         out.append(
             sse_event(
                 "content_block_delta",
-                {
-                    "type": "content_block_delta",
-                    "index": self._text_index,
-                    "delta": {"type": "text_delta", "text": text},
-                },
+                {"type": "content_block_delta", "index": index, "delta": delta},
             )
         )
         return out

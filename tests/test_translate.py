@@ -348,7 +348,8 @@ def test_done_sentinel_and_comments_are_ignored():
 # --------------------------------------------------------------------------- #
 
 
-def test_reasoning_is_rendered_as_text_by_default():
+def test_reasoning_becomes_a_thinking_block_by_default():
+    """Client renders it as collapsed reasoning, not as answer text."""
     payload = {
         "choices": [
             {
@@ -358,6 +359,21 @@ def test_reasoning_is_rendered_as_text_by_default():
         ]
     }
     result = openai_to_anthropic(payload, model="m")
+    assert [b["type"] for b in result["content"]] == ["thinking", "text"]
+    assert result["content"][0]["thinking"] == "let me think"
+    assert result["content"][1]["text"] == "answer"
+
+
+def test_reasoning_as_text_when_requested():
+    payload = {
+        "choices": [
+            {
+                "message": {"reasoning_content": "let me think", "content": "answer"},
+                "finish_reason": "stop",
+            }
+        ]
+    }
+    result = openai_to_anthropic(payload, model="m", reasoning_output="text")
     assert [b["text"] for b in result["content"]] == ["let me think", "answer"]
 
 
@@ -449,3 +465,51 @@ def test_empty_turn_detection():
     assert not _is_empty_turn(
         {"content": [{"type": "tool_use", "id": "t", "name": "f", "input": {}}]}
     )
+
+
+def test_streaming_thinking_mode_emits_thinking_blocks_immediately():
+    """TTFT matters: the client must see progress while the model reasons."""
+    translator = OpenAIStreamTranslator(model="m", reasoning_output="thinking")
+    events = list(translator.start())
+    step1 = {"choices": [{"delta": {"reasoning_content": "step 1 "}}]}
+    step2 = {"choices": [{"delta": {"reasoning_content": "step 2"}}]}
+    events.extend(translator.handle_chunk(step1))
+    events.extend(translator.handle_chunk(step2))
+    events.extend(translator.handle_chunk({"choices": [{"delta": {"content": "answer"}}]}))
+    events.extend(translator.handle_chunk({"choices": [{"delta": {}, "finish_reason": "stop"}]}))
+    events.extend(translator.finish())
+
+    decoded = decode(events)
+    starts = [e for e in decoded if e["type"] == "content_block_start"]
+    assert [s["content_block"]["type"] for s in starts] == ["thinking", "text"]
+
+    thinking = "".join(
+        e["delta"]["thinking"] for e in decoded
+        if e["type"] == "content_block_delta" and e["delta"]["type"] == "thinking_delta"
+    )
+    text = "".join(
+        e["delta"]["text"] for e in decoded
+        if e["type"] == "content_block_delta" and e["delta"]["type"] == "text_delta"
+    )
+    assert thinking == "step 1 step 2"
+    assert text == "answer"
+
+    # Blocks must still balance when switching between kinds.
+    opened = sorted(e["index"] for e in decoded if e["type"] == "content_block_start")
+    closed = sorted(e["index"] for e in decoded if e["type"] == "content_block_stop")
+    assert opened == closed == [0, 1]
+
+
+def test_thinking_blocks_never_travel_back_upstream():
+    """We synthesise them; the request translator must strip them again."""
+    from ctxproxy.translate.request import anthropic_to_openai
+
+    msg = Message(
+        role="assistant",
+        content=[
+            {"type": "thinking", "thinking": "synthesised from reasoning_content"},
+            {"type": "text", "text": "answer"},
+        ],
+    )
+    payload = anthropic_to_openai(make_request([user("q"), msg]), model="m")
+    assert "synthesised" not in json.dumps(payload)

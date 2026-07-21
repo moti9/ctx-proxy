@@ -15,7 +15,7 @@ FINISH_REASON_MAP = {
 
 
 def openai_to_anthropic(
-    payload: dict[str, Any], *, model: str, reasoning_output: str = "text"
+    payload: dict[str, Any], *, model: str, reasoning_output: str = "thinking"
 ) -> dict[str, Any]:
     choices = payload.get("choices") or [{}]
     choice = choices[0]
@@ -27,8 +27,15 @@ def openai_to_anthropic(
     # client-visible equivalent on a translated response, so it is either
     # rendered as text or dropped — see BackendConfig.openai_reasoning_output.
     reasoning = message.get("reasoning_content") or message.get("reasoning")
-    if reasoning and reasoning_output == "text":
-        content.append({"type": "text", "text": str(reasoning)})
+    if reasoning:
+        if reasoning_output == "thinking":
+            # No `signature`: those are Anthropic-issued and validated only on
+            # the native path, which never reaches this translator. Clients
+            # render an unsigned thinking block fine; we strip thinking blocks
+            # again on the way back out, so nothing is ever replayed upstream.
+            content.append({"type": "thinking", "thinking": str(reasoning)})
+        elif reasoning_output == "text":
+            content.append({"type": "text", "text": str(reasoning)})
 
     if text := message.get("content"):
         content.append({"type": "text", "text": text})
