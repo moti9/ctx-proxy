@@ -28,8 +28,9 @@ log = logging.getLogger(__name__)
 
 
 class FoldArchive:
-    def __init__(self, directory: Path) -> None:
+    def __init__(self, directory: Path, max_mb: int = 25) -> None:
         self.directory = Path(directory).expanduser()
+        self.max_bytes = max_mb * 1024 * 1024
 
     def _path(self, session_key: str) -> Path:
         safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in session_key)[:120]
@@ -68,8 +69,38 @@ class FoldArchive:
             "summary_written": summary,
             "messages": [m.model_dump(exclude_none=True) for m in span],
         }
-        with self._path(session_key).open("a") as fh:
+        path = self._path(session_key)
+        with path.open("a") as fh:
             fh.write(json.dumps(entry, default=str) + "\n")
+        self._enforce_cap(path)
+
+    def _enforce_cap(self, path: Path) -> None:
+        """Drop oldest folds once a session's archive exceeds the cap.
+
+        Trims to half the cap rather than exactly to it, so a long session does
+        not rewrite the whole file on every single fold.
+        """
+        if self.max_bytes <= 0 or path.stat().st_size <= self.max_bytes:
+            return
+
+        lines = path.read_text().splitlines()
+        kept: list[str] = []
+        size = 0
+        for line in reversed(lines):          # newest folds are the useful ones
+            size += len(line) + 1
+            if size > self.max_bytes // 2:
+                break
+            kept.append(line)
+        kept.reverse()
+
+        dropped = len(lines) - len(kept)
+        path.write_text("\n".join(kept) + ("\n" if kept else ""))
+        log.info(
+            "archive %s exceeded %d MB; dropped %d oldest fold(s)",
+            path.name,
+            self.max_bytes // (1024 * 1024),
+            dropped,
+        )
 
     def read(self, session_key: str) -> list[dict[str, Any]]:
         path = self._path(session_key)

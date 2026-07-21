@@ -377,3 +377,39 @@ def test_drift_ignores_small_requests():
     assert _MIN_TOKENS_FOR_DRIFT >= 1000, (
         "threshold must be high enough that per-request overhead is negligible"
     )
+
+
+async def test_archive_enforces_a_size_cap(tmp_path):
+    """A long session must not grow its archive without bound."""
+    from ctxproxy.store.archive import FoldArchive
+
+    archive = FoldArchive(tmp_path / "arch", max_mb=1)
+    span = build_conversation(exchanges=6, payload_size=20_000)  # ~big fold
+
+    for _ in range(12):
+        await archive.append("big", span=span, start=0, end=len(span), summary="s")
+
+    path = tmp_path / "arch" / "big.jsonl"
+    size_mb = path.stat().st_size / (1024 * 1024)
+    assert size_mb <= 1.0, f"archive grew to {size_mb:.2f} MB despite a 1 MB cap"
+
+    entries = archive.read("big")
+    assert entries, "trimming must keep the most recent folds, not wipe the file"
+
+
+async def test_archive_prune_removes_expired_files(tmp_path):
+    import os
+    import time
+
+    from ctxproxy.store.archive import FoldArchive
+
+    archive = FoldArchive(tmp_path / "arch")
+    await archive.append("old", span=[user("x")], start=0, end=1, summary="s")
+
+    path = tmp_path / "arch" / "old.jsonl"
+    stale = time.time() - 100 * 3600
+    os.utime(path, (stale, stale))
+
+    assert archive.prune(ttl_hours=72) == 1
+    assert not path.exists()
+    assert archive.prune(ttl_hours=0) == 0, "ttl 0 must disable pruning"

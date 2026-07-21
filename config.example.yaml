@@ -12,7 +12,12 @@ server:
   port: 4000
   log_level: info
   log_format: text          # text | json
-  session_ttl_hours: 72
+  # --- retention -------------------------------------------------------------
+  # Ledgers (small: rolling summary + counters) and fold archives (large: raw
+  # transcripts of everything compaction removed) both live under state_dir.
+  session_ttl_hours: 72        # delete state untouched for this long
+  prune_interval_hours: 6      # re-run retention while the server is up; 0 = startup only
+  archive_max_mb: 25           # per-session archive cap; oldest folds dropped first
 
 policy:
   # Reduce once usable context exceeds this fraction of the budget.
@@ -54,13 +59,15 @@ backends:
     openai_stream_usage: true             # set false if the gateway 400s on stream_options
 
     # Reasoning models (DeepSeek-R1, kimi-k2, QwQ, ...) return a separate
-    # `reasoning_content` field. Anthropic has no client-visible equivalent, so
-    # it is either rendered as a text block ("text" — the chain of thought shows
-    # up inline in Claude Code) or discarded ("drop").
-    # "text" is the safe default: some models leave `content` empty and put the
-    # answer in `reasoning_content`. The proxy falls back to showing reasoning
-    # when a turn would otherwise be empty, so "drop" cannot silence a response.
-    openai_reasoning_output: text         # text | drop
+    # `reasoning_content` field.
+    #   thinking  Anthropic thinking blocks — client shows collapsed reasoning.
+    #             Best default: you see progress within ~200ms instead of a
+    #             blank screen for however long the model reasons.
+    #   text      inline with the answer. Visible, but noisy.
+    #   drop      cleanest transcript, but nothing is shown while it reasons.
+    # Reasoning is still surfaced if a turn would otherwise be empty, so no
+    # setting can silence a response.
+    openai_reasoning_output: thinking     # thinking | text | drop
 
 profiles:
   # First match wins, so order matters. Keep the catch-all last.

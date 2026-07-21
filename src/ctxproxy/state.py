@@ -22,7 +22,9 @@ class AppState:
         self.config = config
         self.registry = BackendRegistry(config.backends)
         self.store = FileLedgerStore(config.server.state_dir)
-        self.archive = FoldArchive(config.server.state_dir / "archive")
+        self.archive = FoldArchive(
+            config.server.state_dir / "archive", config.server.archive_max_mb
+        )
         self.manager = ContextManager(config, self.store, self.archive)
 
         # Counters hold a memo cache keyed by block content, so they must

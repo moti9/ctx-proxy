@@ -223,8 +223,18 @@ class ServerConfig(BaseModel):
     # Where session ledgers live.
     state_dir: Path = Field(default_factory=lambda: Path.home() / ".ctxproxy" / "sessions")
 
-    # Ledgers untouched for this long are pruned at startup.
+    # Ledgers and archives untouched for this long are deleted.
     session_ttl_hours: int = 72
+
+    # How often to re-run retention while the server is up. Startup-only
+    # pruning is not enough for a proxy that stays running for weeks.
+    # 0 disables the periodic sweep (startup still prunes).
+    prune_interval_hours: int = 6
+
+    # Per-session cap on the raw fold archive. Archives hold full
+    # transcripts, so they are far larger than ledgers; when a session
+    # exceeds this the oldest folds are dropped first.
+    archive_max_mb: int = 25
 
 
 class Config(BaseModel):
