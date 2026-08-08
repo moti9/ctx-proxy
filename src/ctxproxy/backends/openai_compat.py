@@ -35,6 +35,8 @@ class OpenAICompatBackend(Backend):
         request: MessagesRequest,
         upstream_model: str,
         client_headers: Mapping[str, str],
+        *,
+        session_key: str | None = None,
     ) -> dict:
         payload = anthropic_to_openai(
             request,
@@ -51,6 +53,23 @@ class OpenAICompatBackend(Backend):
             model=request.model,
             reasoning_output=self.config.openai_reasoning_output,
         )
+
+        if self._capture.enabled:
+            await self._capture.record(
+                session_key or "unknown",
+                kind="complete",
+                upstream_model=upstream_model,
+                payload=payload,
+                response=data,
+            )
+
+        if result.get("stop_reason") == "max_tokens":
+            _warn_truncated(
+                self.name,
+                session_key,
+                requested=payload.get(self.config.openai_max_tokens_field),
+                output_tokens=(data.get("usage") or {}).get("completion_tokens"),
+            )
 
         if _is_empty_turn(result):
             # Observed occasionally from vLLM: HTTP 200, finish_reason "stop",
@@ -74,6 +93,8 @@ class OpenAICompatBackend(Backend):
         client_headers: Mapping[str, str],
         input_tokens: int = 0,
         on_usage: Callable[[int], None] | None = None,
+        *,
+        session_key: str | None = None,
     ) -> AsyncIterator[bytes]:
         payload = anthropic_to_openai(
             request,
@@ -91,6 +112,8 @@ class OpenAICompatBackend(Backend):
             input_tokens=input_tokens,
             reasoning_output=self.config.openai_reasoning_output,
         )
+        # Only populated when capture is on, so the hot path pays nothing.
+        transcript = _StreamTranscript() if self._capture.enabled else None
 
         try:
             async with self._client.stream(
@@ -109,11 +132,32 @@ class OpenAICompatBackend(Backend):
                     chunk = parse_sse_line(line)
                     if chunk is None:
                         continue
+                    if transcript is not None:
+                        transcript.observe(chunk)
                     for event in translator.handle_chunk(chunk):
                         yield event
 
                 for event in translator.finish():
                     yield event
+
+                if translator.stop_reason == "max_tokens":
+                    _warn_truncated(
+                        self.name,
+                        session_key,
+                        requested=payload.get(self.config.openai_max_tokens_field),
+                        output_tokens=translator.output_tokens,
+                    )
+
+                if transcript is not None:
+                    await self._capture.record(
+                        session_key or "unknown",
+                        kind="stream",
+                        upstream_model=upstream_model,
+                        payload=payload,
+                        response=transcript.result(
+                            translator.stop_reason, translator.output_tokens
+                        ),
+                    )
 
                 # Claude Code streams almost everything, so this is where
                 # token-drift samples actually come from.
@@ -166,6 +210,72 @@ class OpenAICompatBackend(Backend):
                     )
                     break
         return headers
+
+
+def _warn_truncated(
+    backend: str,
+    session_key: str | None,
+    *,
+    requested: object,
+    output_tokens: object,
+) -> None:
+    """Surface an output-truncation, the top suspect for partial completion.
+
+    When a reasoning model hits its output ceiling, reasoning + answer + tool
+    calls are cut off mid-turn. The result looks exactly like the model choosing
+    to do only part of a multi-step request, but the cause is the cap, not the
+    model's judgement. Claude Code is told (stop_reason=max_tokens) and should
+    continue, but this makes the cause visible either way.
+    """
+    log.warning(
+        "backend %s hit the output cap (stop_reason=max_tokens, requested=%s, "
+        "produced=%s) session=%s — the turn was cut off mid-generation, which "
+        "can look like the model completing only part of a multi-step request",
+        backend,
+        requested,
+        output_tokens,
+        session_key or "unknown",
+    )
+
+
+class _StreamTranscript:
+    """Reassembles a streamed response for capture. Off the hot path unless
+    capture is enabled; only ever read by a human debugging a session."""
+
+    def __init__(self) -> None:
+        self._text: list[str] = []
+        self._reasoning_chars = 0
+        self._tools: list[str] = []
+        self._finish_reason: str | None = None
+        self._usage: dict | None = None
+
+    def observe(self, chunk: dict) -> None:
+        if usage := chunk.get("usage"):
+            self._usage = usage
+        for choice in chunk.get("choices") or []:
+            if reason := choice.get("finish_reason"):
+                self._finish_reason = reason
+            delta = choice.get("delta") or {}
+            if content := delta.get("content"):
+                self._text.append(content)
+            for key in ("reasoning_content", "reasoning"):
+                if value := delta.get(key):
+                    self._reasoning_chars += len(str(value))
+            for call in delta.get("tool_calls") or []:
+                name = (call.get("function") or {}).get("name")
+                if name:
+                    self._tools.append(name)
+
+    def result(self, stop_reason: str, output_tokens: int) -> dict:
+        return {
+            "finish_reason": self._finish_reason,
+            "stop_reason": stop_reason,
+            "output_tokens": output_tokens,
+            "reasoning_chars": self._reasoning_chars,
+            "tool_calls": self._tools,
+            "usage": self._usage,
+            "text": "".join(self._text),
+        }
 
 
 def _find(headers: Mapping[str, str], name: str) -> str | None:

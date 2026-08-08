@@ -273,6 +273,87 @@ def archive(
 
 
 @app.command()
+def capture(
+    session_key: str = typer.Argument(..., help="Session key (see `ctxproxy sessions`)"),
+    config_path: Path = ConfigOpt,
+    last: int = typer.Option(5, help="Show the most recent N exchanges"),
+    full: bool = typer.Option(False, "--full", help="Print the whole upstream payload as JSON"),
+) -> None:
+    """Show what was actually sent upstream and what came back.
+
+    Requires ``server.debug_capture_dir`` to have been set while the session
+    ran. This is the ground truth for "did the proxy corrupt the request, or is
+    the model just doing less than asked": the payload here is the exact JSON the
+    backend received, translated out of the Anthropic request.
+    """
+    configure("warning", "text")
+    config = _load(config_path)
+
+    if config.server.debug_capture_dir is None:
+        typer.secho(
+            "server.debug_capture_dir is not set, so nothing was captured.\n"
+            "Set it in ctxproxy.yaml, restart, reproduce the issue, then re-run this.",
+            fg=typer.colors.YELLOW,
+        )
+        raise typer.Exit(1)
+
+    from .store.capture import DebugCapture
+
+    entries = DebugCapture(config.server.debug_capture_dir).read(session_key)
+    if not entries:
+        typer.echo(f"No captured exchanges for {session_key!r}.")
+        return
+
+    for i, entry in enumerate(entries[-last:], 1):
+        typer.secho(
+            f"\nExchange {i} [{entry.get('kind')}] {entry.get('captured_at')} "
+            f"-> {entry.get('upstream_model')} "
+            f"({entry.get('message_count')} msgs, max_tokens={entry.get('max_tokens')})",
+            bold=True,
+        )
+        if full:
+            typer.echo(json.dumps(entry.get("payload"), indent=2))
+        else:
+            for msg in entry.get("payload", {}).get("messages", []):
+                role = msg.get("role")
+                content = msg.get("content")
+                text = content if isinstance(content, str) else json.dumps(content)
+                tool = " +tool_calls" if msg.get("tool_calls") else ""
+                typer.echo(f"  [{role}{tool}] {(text or '')[:200]}")
+
+        response = entry.get("response") or {}
+        if isinstance(response, dict):
+            finish = response.get("finish_reason") or (
+                (response.get("choices") or [{}])[0].get("finish_reason")
+            )
+            if finish:
+                colour = typer.colors.RED if finish == "length" else typer.colors.GREEN
+                typer.secho(f"  -> finish_reason={finish}", fg=colour)
+
+    truncated = sum(
+        1
+        for e in entries
+        if _finish_reason(e) == "length"
+    )
+    typer.echo(f"\n{len(entries)} exchange(s) captured; {truncated} ended in truncation (length).")
+    if truncated:
+        typer.secho(
+            "Truncation (finish_reason=length) means the model hit its output cap "
+            "mid-turn — a direct cause of completing only part of a request.",
+            fg=typer.colors.YELLOW,
+        )
+
+
+def _finish_reason(entry: dict) -> str | None:
+    response = entry.get("response") or {}
+    if not isinstance(response, dict):
+        return None
+    return response.get("finish_reason") or (
+        (response.get("choices") or [{}])[0].get("finish_reason")
+    )
+
+
+@app.command()
 def reset(
     session_key: str = typer.Argument(None, help="Session to clear; omit for all"),
     config_path: Path = ConfigOpt,

@@ -104,7 +104,7 @@ async def create_message(http_request: Request):
         try:
             first, stream = await _open_stream(
                 backend, prepared, upstream_model, headers, result.tokens_after,
-                observed.append,
+                observed.append, session_key=session.value,
             )
         except UpstreamError as exc:
             if not (exc.is_context_overflow() and policy.overflow_retry_enabled):
@@ -122,7 +122,7 @@ async def create_message(http_request: Request):
                 prepared = _prepare(retry.request, profile)
                 first, stream = await _open_stream(
                     backend, prepared, upstream_model, headers, retry.tokens_after,
-                    observed.append,
+                    observed.append, session_key=session.value,
                 )
             except (UpstreamError, ProxyError) as retry_exc:
                 return retry_exc.to_response()
@@ -135,7 +135,9 @@ async def create_message(http_request: Request):
 
     # -- non-streaming ------------------------------------------------------ #
     try:
-        payload = await backend.complete(prepared, upstream_model, headers)
+        payload = await backend.complete(
+            prepared, upstream_model, headers, session_key=session.value
+        )
     except UpstreamError as exc:
         if not (exc.is_context_overflow() and policy.overflow_retry_enabled):
             return exc.to_response()
@@ -149,7 +151,8 @@ async def create_message(http_request: Request):
         try:
             retry, _ = await reduce(target_ratio=policy.overflow_retry_ratio)
             payload = await backend.complete(
-                _prepare(retry.request, profile), upstream_model, headers
+                _prepare(retry.request, profile), upstream_model, headers,
+                session_key=session.value,
             )
         except (UpstreamError, ProxyError) as retry_exc:
             return retry_exc.to_response()
@@ -341,7 +344,10 @@ def _strip_cache_control(request: MessagesRequest) -> None:
         ]
 
 
-async def _open_stream(backend, request, upstream_model, headers, input_tokens, on_usage=None):
+async def _open_stream(
+    backend, request, upstream_model, headers, input_tokens, on_usage=None,
+    *, session_key=None,
+):
     """Start a stream and pull the first chunk.
 
     Pulling eagerly is what makes retry-on-overflow possible: the upstream
@@ -349,7 +355,10 @@ async def _open_stream(backend, request, upstream_model, headers, input_tokens, 
     rejection can still be recovered from. Once bytes are flushed, it is too
     late.
     """
-    stream = backend.stream(request, upstream_model, headers, input_tokens, on_usage)
+    stream = backend.stream(
+        request, upstream_model, headers, input_tokens, on_usage,
+        session_key=session_key,
+    )
     try:
         first = await stream.__anext__()
     except StopAsyncIteration:

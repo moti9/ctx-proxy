@@ -243,6 +243,13 @@ class ServerConfig(BaseModel):
     # exceeds this the oldest folds are dropped first.
     archive_max_mb: int = 25
 
+    # Diagnostic only, OFF by default. When set, the exact payload sent upstream
+    # and the response received are written per session under this directory —
+    # the one place you can see what the model actually got, as opposed to what
+    # the client sent. Payloads contain full conversation text, so this is
+    # deliberately opt-in and should be pointed somewhere private.
+    debug_capture_dir: Path | None = None
+
     @property
     def effective_archive_ttl_hours(self) -> int:
         return (

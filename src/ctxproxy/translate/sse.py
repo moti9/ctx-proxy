@@ -55,6 +55,16 @@ class OpenAIStreamTranslator:
     _dropped_reasoning: list[str] = field(default_factory=list)
     _emitted_content: bool = False
 
+    # -- introspection (for logging/capture, not the wire) ------------------ #
+
+    @property
+    def stop_reason(self) -> str:
+        return self._stop_reason
+
+    @property
+    def output_tokens(self) -> int:
+        return self._output_tokens
+
     # -- lifecycle ---------------------------------------------------------- #
 
     def start(self) -> list[bytes]:

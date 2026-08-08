@@ -19,6 +19,14 @@ server:
   # archive_ttl_hours: 168     # keep archives a shorter time than ledgers
   prune_interval_hours: 6      # re-run retention while the server is up; 0 = startup only
   archive_max_mb: 25           # per-session archive cap; oldest folds dropped first
+  # --- diagnostics (opt-in, OFF by default) ----------------------------------
+  # Uncomment to record the exact payload sent upstream and the response, per
+  # session, so `ctxproxy capture <session>` can show what the model actually
+  # got. Use when a session behaves as though it forgot part of a request:
+  # a faithful payload with finish_reason=length points at the output cap, a
+  # payload missing content points at translation. Payloads hold full
+  # conversation text — keep this path private and clean it up when done.
+  # debug_capture_dir: ~/.ctxproxy/capture
 
 policy:
   # Reduce once usable context exceeds this fraction of the budget.

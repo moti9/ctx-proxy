@@ -9,6 +9,7 @@ from .config import Config, ModelProfile
 from .context.manager import ContextManager
 from .context.summarizer import Summarizer
 from .store.archive import FoldArchive
+from .store.capture import DebugCapture
 from .store.file import FileLedgerStore
 from .tokens.base import TokenCounter, build_counter
 from .tokens.upstream import UpstreamCounter
@@ -20,7 +21,8 @@ log = logging.getLogger(__name__)
 class AppState:
     def __init__(self, config: Config) -> None:
         self.config = config
-        self.registry = BackendRegistry(config.backends)
+        self.capture = DebugCapture(config.server.debug_capture_dir)
+        self.registry = BackendRegistry(config.backends, self.capture)
         self.store = FileLedgerStore(config.server.state_dir)
         self.archive = FoldArchive(
             config.server.state_dir / "archive", config.server.archive_max_mb

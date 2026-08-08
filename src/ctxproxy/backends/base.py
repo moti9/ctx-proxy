@@ -10,6 +10,7 @@ import httpx
 
 from ..config import BackendConfig
 from ..errors import UpstreamError
+from ..store.capture import DebugCapture
 from ..types_anthropic import MessagesRequest
 
 log = logging.getLogger(__name__)
@@ -39,8 +40,9 @@ AUTH_HEADERS = frozenset({"x-api-key", "authorization", "api-key"})
 class Backend(ABC):
     """An upstream that speaks (or is made to speak) the Anthropic Messages API."""
 
-    def __init__(self, config: BackendConfig) -> None:
+    def __init__(self, config: BackendConfig, capture: DebugCapture | None = None) -> None:
         self.config = config
+        self._capture = capture or DebugCapture(None)
         self._client = httpx.AsyncClient(
             base_url=config.base_url.rstrip("/"),
             timeout=httpx.Timeout(
@@ -60,8 +62,14 @@ class Backend(ABC):
         request: MessagesRequest,
         upstream_model: str,
         client_headers: Mapping[str, str],
+        *,
+        session_key: str | None = None,
     ) -> dict:
-        """Non-streaming call. Returns an Anthropic-shaped message object."""
+        """Non-streaming call. Returns an Anthropic-shaped message object.
+
+        ``session_key`` is used only to label diagnostic capture; it does not
+        affect what is sent upstream.
+        """
 
     @abstractmethod
     def stream(
@@ -71,6 +79,8 @@ class Backend(ABC):
         client_headers: Mapping[str, str],
         input_tokens: int = 0,
         on_usage: Callable[[int], None] | None = None,  # noqa: ARG002
+        *,
+        session_key: str | None = None,
     ) -> AsyncIterator[bytes]:
         """Streaming call. Yields Anthropic-shaped SSE bytes."""
 

@@ -27,6 +27,8 @@ class AnthropicBackend(Backend):
         request: MessagesRequest,
         upstream_model: str,
         client_headers: Mapping[str, str],
+        *,
+        session_key: str | None = None,  # noqa: ARG002 — native path is passthrough
     ) -> dict:
         payload = self._payload(request, upstream_model, stream=False)
         return await self._post_json("/v1/messages", payload, self._headers(client_headers))
@@ -38,6 +40,8 @@ class AnthropicBackend(Backend):
         client_headers: Mapping[str, str],
         input_tokens: int = 0,  # noqa: ARG002 — upstream reports real counts itself
         on_usage: Callable[[int], None] | None = None,  # noqa: ARG002
+        *,
+        session_key: str | None = None,  # noqa: ARG002 — native path is passthrough
     ) -> AsyncIterator[bytes]:
         payload = self._payload(request, upstream_model, stream=True)
         headers = self._headers(client_headers)
