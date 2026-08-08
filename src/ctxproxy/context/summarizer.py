@@ -58,14 +58,23 @@ established so far. Record exact names — approximations cause broken reference
 Open errors, failing tests, unanswered questions, known-broken states. Be specific: \
 exact error text beats a paraphrase.
 
+## Pending user requests
+Every distinct thing the user asked for that the transcript does NOT yet show \
+finished. When a single message asked for several things, list each one \
+separately. Quote the user's own words for each. This is the section whose loss \
+causes the agent to complete only some of a multi-part request, so err towards \
+keeping an item rather than assuming it was done.
+
 ## Next
 The immediate next step, if one was established.
 
 Rules:
-- Write factually and densely. No hedging, no "the user asked".
+- Write factually and densely. No hedging.
 - Keep exact identifiers, paths, and error strings verbatim.
 - Never invent progress that is not in the transcript.
-- Carry forward unresolved items until the transcript shows them resolved.
+- Carry forward unresolved items and pending requests until the transcript shows \
+them resolved. A request is only done when the transcript shows it done, not \
+when it was acknowledged.
 """
 
 
@@ -109,7 +118,7 @@ class Summarizer:
         for chunk in chunks:
             summary = await self._fold_once(summary, chunk, ledger)
 
-        return _preserve_anchors(summary, span)
+        return _preserve_instructions(_preserve_anchors(summary, span), span)
 
     async def _fold_once(self, prior: str, transcript: str, ledger: SessionLedger) -> str:
         sections = []
@@ -270,3 +279,99 @@ def _walk_strings(value: object) -> list[str]:
     if isinstance(value, list):
         return [s for v in value for s in _walk_strings(v)]
     return []
+
+
+# --------------------------------------------------------------------------- #
+# Pending-instruction preservation
+# --------------------------------------------------------------------------- #
+
+# A user turn shorter than this is a control cue ("ok", "go on") that carries no
+# instruction worth rescuing.
+_MIN_INSTRUCTION_CHARS = 12
+_MAX_INSTRUCTION_CHARS = 600
+_MAX_INSTRUCTIONS = 15
+# How much of an instruction's opening must reappear in the summary before we
+# treat it as already captured and skip re-attaching it.
+_INSTRUCTION_PROBE_CHARS = 60
+
+_NORMALIZE_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _normalize(text: str) -> str:
+    """Lowercase, punctuation-insensitive form for prose comparison.
+
+    Prose comparison must survive re-punctuation: a summariser that keeps an
+    instruction but drops its trailing full stop should still count as having
+    kept it, or the backstop appends a near-duplicate on every fold.
+    """
+    return _NORMALIZE_RE.sub(" ", text.lower()).strip()
+
+
+def _extract_user_instructions(span: list[Message]) -> list[str]:
+    """Verbatim text of genuine user turns in a folded span.
+
+    Excludes tool-result carriers (those are outputs, not requests) and the
+    spliced prior-summary turn (which is our own text, not the user's).
+    """
+    out: list[str] = []
+    for msg in span:
+        if msg.role != "user":
+            continue
+        if any(b.get("type") == "tool_result" for b in msg.blocks()):
+            continue
+        text = message_text(msg).strip()
+        if len(text) < _MIN_INSTRUCTION_CHARS:
+            continue
+        if text.startswith("<conversation-summary>"):
+            continue
+        if text not in out:
+            out.append(text)
+    return out
+
+
+def _preserve_instructions(summary: str, span: list[Message]) -> str:
+    """Re-attach user instructions the summariser dropped.
+
+    The counterpart to :func:`_preserve_anchors`, and the more important half:
+    a paraphrased file path is a nuisance, but a dropped instruction is the
+    difference between finishing a six-part request and finishing two of it.
+    The summariser is *told* to keep pending requests (see SYSTEM_PROMPT), but
+    a weak model treats a list of asks as narration and drops it — so anything
+    whose opening does not survive verbatim is re-attached mechanically.
+
+    A completed instruction may be re-attached too; that is deliberate. Redoing
+    the check for a finished item costs a turn, whereas silently dropping an
+    unfinished one costs the result — so the bias is towards keeping it, and the
+    section is labelled so the model reconciles it against what is done above.
+    """
+    instructions = _extract_user_instructions(span)
+    if not instructions:
+        return summary
+
+    haystack = _normalize(summary)
+    missing: list[str] = []
+    for text in instructions:
+        probe = _normalize(text)[:_INSTRUCTION_PROBE_CHARS]
+        if probe and probe in haystack:
+            continue
+        if len(text) > _MAX_INSTRUCTION_CHARS:
+            text = text[:_MAX_INSTRUCTION_CHARS] + " …"
+        missing.append(text)
+        if len(missing) >= _MAX_INSTRUCTIONS:
+            break
+
+    if not missing:
+        return summary
+
+    log.info(
+        "summary dropped %d/%d user instruction(s); re-attaching verbatim",
+        len(missing),
+        len(instructions),
+    )
+    lines = "\n".join(f"- {m}" for m in missing)
+    return (
+        f"{summary}\n\n## User requests from the compacted span (verbatim)\n"
+        f"These are things the user asked for before this span was compacted. "
+        f"Treat any not shown complete above as still pending — do not assume "
+        f"they were finished.\n{lines}"
+    )

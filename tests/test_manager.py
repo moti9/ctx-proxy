@@ -311,6 +311,57 @@ async def test_dropped_anchors_are_reattached_to_the_summary():
     assert "preserved verbatim" in summary
 
 
+async def test_dropped_user_instructions_are_reattached_to_the_summary():
+    """The failure the whole investigation is about: a multi-part request folded
+    into a summary that silently drops the not-yet-done items."""
+    from ctxproxy.config import ModelProfile
+    from ctxproxy.context.summarizer import Summarizer
+
+    async def lazy_summariser(request):
+        # A weak model that acknowledges the work but drops the actual asks.
+        return "## State\nWorked on the auth module and fixed the login timeout."
+
+    profile = ModelProfile(match="s", backend="internal", context_window=32000)
+    summarizer = Summarizer(lazy_summariser, profile)
+
+    span = [
+        user("Please fix these: 1) the login timeout, 2) the CSRF token bug, "
+             "3) the password-reset email, 4) the rate limiter."),
+        assistant("Fixed the login timeout."),
+        user("Continue with the rest."),
+    ]
+    ledger = SessionLedger(session_key="k")
+
+    summary = await summarizer.fold(span, ledger)
+
+    # The instructions the summariser dropped must be recoverable verbatim.
+    assert "CSRF token bug" in summary
+    assert "password-reset email" in summary
+    assert "rate limiter" in summary
+    assert "still pending" in summary
+
+
+async def test_preserved_instructions_are_skipped_when_summary_keeps_them():
+    """No duplication when the summariser already captured the request."""
+    from ctxproxy.config import ModelProfile
+    from ctxproxy.context.summarizer import Summarizer
+
+    async def faithful_summariser(request):
+        return (
+            "## State\nStarting work.\n## Pending user requests\n"
+            "- Add pagination to the search endpoint verbatim as asked"
+        )
+
+    profile = ModelProfile(match="s", backend="internal", context_window=32000)
+    summarizer = Summarizer(faithful_summariser, profile)
+
+    span = [user("Add pagination to the search endpoint verbatim as asked.")]
+    summary = await summarizer.fold(span, SessionLedger(session_key="k"))
+
+    # Already present, so the mechanical backstop must not append a second copy.
+    assert "## User requests from the compacted span" not in summary
+
+
 async def test_folded_messages_are_archived_before_being_lost(config, tmp_path, counter):
     """Compaction is the one irreversible step; the raw span must be recoverable."""
     from ctxproxy.store.archive import FoldArchive
