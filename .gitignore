@@ -62,3 +62,11 @@ Thumbs.db
 nohup.out
 /tmp/
 scratch/
+
+# --- archives -------------------------------------------------------------
+*.zip
+*.tar.gz
+*.tar.bz2
+*.jsonl
+*.csv
+*.json
