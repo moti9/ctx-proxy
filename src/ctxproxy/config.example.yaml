@@ -19,6 +19,22 @@ server:
   # archive_ttl_hours: 168     # keep archives a shorter time than ledgers
   prune_interval_hours: 6      # re-run retention while the server is up; 0 = startup only
   archive_max_mb: 25           # per-session archive cap; oldest folds dropped first
+  # --- diagnostics (opt-in, OFF by default) ----------------------------------
+  # Uncomment to record the exact payload sent upstream and the response, per
+  # session, so `ctxproxy capture <session>` can show what the model actually
+  # got. Use when a session behaves as though it forgot part of a request:
+  # a faithful payload with finish_reason=length points at the output cap, a
+  # payload missing content points at translation. Payloads hold full
+  # conversation text — keep this path private and clean it up when done.
+  # debug_capture_dir: ~/.ctxproxy/capture
+  # capture_max_mb: 50         # per-session cap; oldest exchanges dropped first.
+                               # Captures are pruned on the archive TTL too, so
+                               # it is safe to leave capture on during real work.
+  # --- failover --------------------------------------------------------------
+  upstream_cooldown_s: 30      # after a model returns 429/5xx it is skipped for
+                               # this long (see a profile's `fallbacks:` below),
+                               # then re-probed so a recovered top model is used
+                               # again automatically.
 
 policy:
   # Reduce once usable context exceeds this fraction of the budget.
@@ -125,3 +141,38 @@ profiles:
     supports_prompt_caching: false
     tokenizer:
       kind: heuristic
+
+    # ---- Failover chain (optional) -----------------------------------------
+    # When THIS profile's model returns a capacity/availability error (429/502/
+    # 503/529 — e.g. LiteLLM "no deployments available"), the request is re-sent
+    # to each of these profiles in order. They are references to OTHER profiles
+    # by `match`, so every fallback brings its own backend, model, context
+    # window, token caps and tokenizer — a differently sized model on a
+    # different provider is budgeted correctly. The primary is always preferred
+    # and re-probed after server.upstream_cooldown_s, so a recovered top model is
+    # used again automatically.
+    # fallbacks: ["backup-fast", "backup-strong"]
+
+  # ---- Fallback profiles (optional) ----------------------------------------
+  # Referenced only via a `fallbacks:` chain — give them `match` names that are
+  # NOT model ids any client sends. Each is a full profile, so failover can
+  # cross providers (a different backend) and models of any size.
+  # - match: "backup-fast"
+  #   backend: internal
+  #   upstream_model: some-other-vllm-model
+  #   native_anthropic: false
+  #   context_window: 131072
+  #   max_output_tokens: 16000
+  #   output_reserve: 16000
+  #   safety_buffer: 12000
+  #   supports_count_tokens: false
+  #   supports_prompt_caching: false
+  #   tokenizer: {kind: heuristic}
+  # - match: "backup-strong"
+  #   backend: anthropic            # a whole different provider as the safety net
+  #   upstream_model: claude-sonnet-4-5
+  #   native_anthropic: true
+  #   context_window: 200000
+  #   output_reserve: 32000
+  #   safety_buffer: 12000
+  #   tokenizer: {kind: upstream}

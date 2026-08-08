@@ -43,38 +43,17 @@ async def create_message(http_request: Request):
     except UnknownModelError as exc:
         return ConfigurationError(str(exc)).to_response()
 
-    upstream_model = profile.resolve_upstream_model(req.model)
     session = derive_session_key(http_request.headers, req)
-    counter = state.counter_for(profile, upstream_model)
-    summarizer = state.summarizer_for(profile, req.model)
     headers = dict(http_request.headers)
-
-    # Failover chain, with any currently-cooling-down target moved to the back.
-    # A single-element list (no fallbacks configured) makes the loops below
-    # behave exactly as a direct dispatch.
-    targets = state.health.order(profile.targets(req.model))
-
-    async def reduce(target_ratio: float | None = None):
-        # Re-validate from the untouched body: the pipeline mutates the request
-        # in place, so a retry must start from the client's original payload,
-        # not from the already-reduced one.
-        fresh = MessagesRequest.model_validate(body)
-        return await state.manager.process(
-            fresh,
-            profile=profile,
-            session_key=session.value,
-            counter=counter,
-            summarizer=summarizer,
-            target_ratio=target_ratio,
-        )
-
-    try:
-        result, _ledger = await reduce()
-    except ProxyError as exc:
-        return exc.to_response()
-
-    prepared = _prepare(result.request, profile)
     policy = state.config.policy
+
+    # Failover chain: the matched profile, then each fallback profile it names,
+    # with any currently-cooling-down target moved to the back. Each element is
+    # a full profile, so reduction, the max_tokens clamp and translation all use
+    # that model's own window/caps/tokenizer. A single-element chain (no
+    # fallbacks configured) behaves exactly as a direct dispatch.
+    chain = [profile, *state.config.fallback_profiles(profile)]
+    ordered = state.health.order(chain, key=lambda p: _target_of(p, req.model))
 
     if session.source == "fingerprint" and _first_sighting(state, session.value):
         # Header-based identity is exact; the fingerprint is a fallback. Say so
@@ -89,35 +68,49 @@ async def create_message(http_request: Request):
             ) or ["none"],
         )
 
-    log_event(
-        log,
-        "dispatch",
-        session=session.value,
-        source=session.source,
-        model=req.model,
-        upstream=targets[0][1],
-        backend=targets[0][0],
-        fallbacks=len(targets) - 1,
-        tokens=result.tokens_after,
-        saved=result.saved,
-        stream=req.stream,
-    )
+    last_exc: UpstreamError | None = None
+    for i, prof in enumerate(ordered):
+        upstream = prof.resolve_upstream_model(req.model)
+        target = (prof.backend, upstream)
+        backend = state.registry.get(prof.backend)
+        counter = state.counter_for(prof, upstream)
+        summarizer = state.summarizer_for(prof, req.model)
+        reduce = _make_reduce(state, body, session.value, prof, counter, summarizer)
 
-    # -- streaming ---------------------------------------------------------- #
-    if req.stream:
-        last_exc: UpstreamError | None = None
-        for i, (backend_name, upstream) in enumerate(targets):
-            backend = state.registry.get(backend_name)
+        # Budget with THIS profile — a fallback re-reduces to its own window.
+        try:
+            result, _ledger = await reduce()
+        except ProxyError as exc:
+            return exc.to_response()
+        prepared = _prepare(result.request, prof)
+
+        log_event(
+            log,
+            "dispatch",
+            session=session.value,
+            source=session.source,
+            model=req.model,
+            upstream=upstream,
+            backend=prof.backend,
+            attempt=i,
+            fallbacks=len(ordered) - 1,
+            tokens=result.tokens_after,
+            saved=result.saved,
+            stream=req.stream,
+        )
+
+        # -- streaming ------------------------------------------------------ #
+        if req.stream:
             observed: list[int] = []
             try:
                 first, stream, tokens_after = await _open_stream_target(
                     backend, prepared, upstream, headers, result.tokens_after,
-                    observed.append, session.value, profile, policy, reduce,
+                    observed.append, session.value, prof, policy, reduce,
                 )
             except UpstreamError as exc:
-                if _should_failover(exc, i, targets):
-                    state.health.mark_down((backend_name, upstream))
-                    _log_failover(session.value, (backend_name, upstream), targets[i + 1], exc)
+                if _should_failover(exc, i, ordered):
+                    state.health.mark_down(target)
+                    _log_failover(session.value, target, _target_of(ordered[i + 1], req.model), exc)
                     last_exc = exc
                     continue
                 _log_upstream_error(session.value, exc, retried=i > 0)
@@ -125,26 +118,22 @@ async def create_message(http_request: Request):
             except ProxyError as exc:
                 return exc.to_response()
 
-            state.health.mark_up((backend_name, upstream))
+            state.health.mark_up(target)
             return StreamingResponse(
                 _replay(first, stream, state, session.value, tokens_after, observed),
                 media_type="text/event-stream",
                 headers={"cache-control": "no-cache", "x-ctxproxy-session": session.value},
             )
-        return last_exc.to_response()  # every target failed with a retryable error
 
-    # -- non-streaming ------------------------------------------------------ #
-    last_exc = None
-    for i, (backend_name, upstream) in enumerate(targets):
-        backend = state.registry.get(backend_name)
+        # -- non-streaming -------------------------------------------------- #
         try:
             payload = await _complete_target(
-                backend, prepared, upstream, headers, session.value, profile, policy, reduce,
+                backend, prepared, upstream, headers, session.value, prof, policy, reduce,
             )
         except UpstreamError as exc:
-            if _should_failover(exc, i, targets):
-                state.health.mark_down((backend_name, upstream))
-                _log_failover(session.value, (backend_name, upstream), targets[i + 1], exc)
+            if _should_failover(exc, i, ordered):
+                state.health.mark_down(target)
+                _log_failover(session.value, target, _target_of(ordered[i + 1], req.model), exc)
                 last_exc = exc
                 continue
             _log_upstream_error(session.value, exc, retried=i > 0)
@@ -152,9 +141,10 @@ async def create_message(http_request: Request):
         except ProxyError as exc:
             return exc.to_response()
 
-        state.health.mark_up((backend_name, upstream))
+        state.health.mark_up(target)
         await _record_drift(state, session.value, result.tokens_after, payload)
         return JSONResponse(payload, headers={"x-ctxproxy-session": session.value})
+
     return last_exc.to_response()  # every target failed with a retryable error
 
 
@@ -274,6 +264,31 @@ def _log_upstream_error(session_key: str, exc: UpstreamError, *, retried: bool =
         retried=retried,
         detail=exc.text[:300] + hint,
     )
+
+
+def _target_of(profile, requested_model: str) -> tuple[str, str]:
+    """The (backend, upstream_model) health key for a profile on this request."""
+    return (profile.backend, profile.resolve_upstream_model(requested_model))
+
+
+def _make_reduce(state, body, session_value, profile, counter, summarizer):
+    """A reduce() bound to one profile, so a failover re-budgets to that model's
+    own window/caps/tokenizer rather than the primary's."""
+
+    async def reduce(target_ratio: float | None = None):
+        # Re-validate from the untouched body: the pipeline mutates the request
+        # in place, so each attempt starts from the client's original payload.
+        fresh = MessagesRequest.model_validate(body)
+        return await state.manager.process(
+            fresh,
+            profile=profile,
+            session_key=session_value,
+            counter=counter,
+            summarizer=summarizer,
+            target_ratio=target_ratio,
+        )
+
+    return reduce
 
 
 def _should_failover(exc: UpstreamError, index: int, targets: list) -> bool:

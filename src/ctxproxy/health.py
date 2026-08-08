@@ -19,8 +19,11 @@ cooldown is cleared; if it fails again it is pushed back out.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
+from typing import TypeVar
 
 Target = tuple[str, str]  # (backend name, upstream model)
+T = TypeVar("T")
 
 
 class HealthTracker:
@@ -41,16 +44,23 @@ class HealthTracker:
     def mark_up(self, target: Target) -> None:
         self._down_until.pop(target, None)
 
-    def order(self, targets: list[Target]) -> list[Target]:
-        """Priority order with currently-cooling-down targets moved to the back.
+    def order(
+        self, items: list[T], key: Callable[[T], Target] | None = None
+    ) -> list[T]:
+        """Priority order with currently-cooling-down items moved to the back.
 
-        Relative priority among healthy targets (and among cooling-down ones) is
-        preserved, so the primary is always preferred while it is healthy. If
-        every target is cooling down the original order is returned unchanged, so
-        the primary is still re-probed first rather than the proxy giving up.
+        ``key`` maps an item to its (backend, model) target; it defaults to the
+        identity, so a list of targets can be ordered directly, but a list of
+        profiles can be ordered by keying on their resolved target. Relative
+        priority is preserved within the healthy and cooling groups, so the
+        primary is always preferred while healthy. If every item is cooling down
+        the original order is returned unchanged, so the primary is still
+        re-probed first rather than the proxy giving up.
         """
-        healthy = [t for t in targets if self.available(t)]
-        if not healthy:
-            return list(targets)
-        cooling = [t for t in targets if t not in healthy]
-        return healthy + cooling
+        k = key or (lambda x: x)  # type: ignore[return-value,assignment]
+        healthy_idx = [i for i, it in enumerate(items) if self.available(k(it))]
+        if not healthy_idx:
+            return list(items)
+        healthy = set(healthy_idx)
+        cooling_idx = [i for i in range(len(items)) if i not in healthy]
+        return [items[i] for i in healthy_idx + cooling_idx]

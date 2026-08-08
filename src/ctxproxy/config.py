@@ -108,22 +108,6 @@ class TokenizerConfig(BaseModel):
     image_token_cost: int = 1600
 
 
-class FallbackTarget(BaseModel):
-    """One entry in a profile's failover chain.
-
-    A target the request is re-sent to when the primary (and any earlier
-    fallback) is unavailable. Same backend by default — the common case is just
-    a different model on the same gateway (e.g. kimi-latest -> claude-sonnet-4-6
-    on the same LiteLLM base_url) — but a different backend is allowed too, so a
-    kimi outage can fail over to a native Anthropic or OpenAI upstream.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    model: str
-    backend: str | None = None
-
-
 class ModelProfile(BaseModel):
     """Per-model capability declaration. The whole design hinges on this."""
 
@@ -136,11 +120,16 @@ class ModelProfile(BaseModel):
     # The model name to send upstream. Defaults to the incoming name.
     upstream_model: str | None = None
 
-    # Ordered failover chain. When the primary returns a capacity/availability
-    # error (429/502/503/529), the request is re-sent to each of these in turn.
-    # The primary is always preferred and re-probed after its cooldown, so once
-    # it recovers it is used again automatically.
-    fallbacks: list[FallbackTarget] = Field(default_factory=list)
+    # Ordered failover chain, given as references to OTHER profiles by their
+    # `match` name. When this profile's model returns a capacity/availability
+    # error (429/502/503/529), the request is re-sent to each referenced profile
+    # in turn. Because each fallback is a *full profile*, it carries its own
+    # backend, upstream_model, context_window, token caps, tokenizer and
+    # native/openai setting — so failing over to a differently sized model on a
+    # different provider is budgeted and translated correctly. The primary is
+    # always preferred and re-probed after its cooldown, so once it recovers it
+    # is used again automatically.
+    fallbacks: list[str] = Field(default_factory=list)
 
     native_anthropic: bool = True
 
@@ -177,18 +166,6 @@ class ModelProfile(BaseModel):
 
     def resolve_upstream_model(self, requested: str) -> str:
         return self.upstream_model or requested
-
-    def targets(self, requested: str) -> list[tuple[str, str]]:
-        """The failover chain as ordered (backend, upstream_model) pairs.
-
-        The primary first, then each fallback (defaulting to this profile's
-        backend). With no fallbacks configured this is a single element and the
-        dispatch path behaves exactly as before.
-        """
-        out = [(self.backend, self.resolve_upstream_model(requested))]
-        for fb in self.fallbacks:
-            out.append((fb.backend or self.backend, fb.model))
-        return out
 
     def matches(self, model: str) -> bool:
         return bool(re.fullmatch(_glob_to_regex(self.match), model))
@@ -325,12 +302,6 @@ class Config(BaseModel):
                     f"profile {p.match!r} references unknown backend {p.backend!r}; "
                     f"defined backends: {sorted(names)}"
                 )
-            for fb in p.fallbacks:
-                if fb.backend is not None and fb.backend not in names:
-                    raise ValueError(
-                        f"profile {p.match!r} fallback to model {fb.model!r} references "
-                        f"unknown backend {fb.backend!r}; defined backends: {sorted(names)}"
-                    )
         matches = {p.match for p in self.profiles}
         for p in self.profiles:
             if p.summarizer and p.summarizer not in matches:
@@ -338,6 +309,14 @@ class Config(BaseModel):
                     f"profile {p.match!r} names summarizer {p.summarizer!r}, "
                     f"which is not a defined profile match"
                 )
+            for ref in p.fallbacks:
+                if ref == p.match:
+                    raise ValueError(f"profile {p.match!r} lists itself as a fallback")
+                if ref not in matches:
+                    raise ValueError(
+                        f"profile {p.match!r} lists fallback {ref!r}, which is not a "
+                        f"defined profile match. Define a profile with match: {ref!r}."
+                    )
         return self
 
     def backend(self, name: str) -> BackendConfig:
@@ -358,6 +337,10 @@ class Config(BaseModel):
             if p.match == match:
                 return p
         raise KeyError(match)
+
+    def fallback_profiles(self, profile: ModelProfile) -> list[ModelProfile]:
+        """Resolve a profile's fallback references to full profiles, in order."""
+        return [self.profile_by_match(ref) for ref in profile.fallbacks]
 
     def summarizer_for(self, profile: ModelProfile) -> ModelProfile:
         if profile.summarizer:
