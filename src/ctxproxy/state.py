@@ -21,7 +21,9 @@ log = logging.getLogger(__name__)
 class AppState:
     def __init__(self, config: Config) -> None:
         self.config = config
-        self.capture = DebugCapture(config.server.debug_capture_dir)
+        self.capture = DebugCapture(
+            config.server.debug_capture_dir, config.server.capture_max_mb
+        )
         self.registry = BackendRegistry(config.backends, self.capture)
         self.store = FileLedgerStore(config.server.state_dir)
         self.archive = FoldArchive(

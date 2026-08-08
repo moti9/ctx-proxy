@@ -59,6 +59,44 @@ async def test_capture_records_and_reads_back(tmp_path):
     assert entries[0]["message_count"] == 1
 
 
+async def test_capture_enforces_a_size_cap(tmp_path):
+    """A long session appends the whole growing conversation each turn; the file
+    must stay bounded, keeping the newest exchanges."""
+    cap = DebugCapture(tmp_path / "cap", max_mb=1)  # 1 MB cap -> trims to ~0.5 MB
+    big = {"model": "m", "messages": [{"role": "user", "content": "x" * 50_000}]}
+    for i in range(60):  # ~50KB each -> ~3MB total, well over the cap
+        await cap.record("s", kind="complete", upstream_model="m",
+                         payload={**big, "turn": i})
+
+    path = tmp_path / "cap" / "s.jsonl"
+    assert path.stat().st_size <= 1024 * 1024, "capture must be trimmed to the cap"
+    entries = cap.read("s")
+    assert entries, "recent exchanges must survive the trim"
+    # Newest kept: the last turn recorded must still be present.
+    assert entries[-1]["payload"]["turn"] == 59
+
+
+def test_capture_prune_removes_old_files(tmp_path):
+    import os
+    import time
+
+    cap = DebugCapture(tmp_path / "cap")
+    path = tmp_path / "cap"
+    path.mkdir()
+    old = path / "old.jsonl"
+    old.write_text('{"kind":"complete"}\n')
+    # Backdate it well past any positive TTL.
+    ancient = time.time() - 10 * 24 * 3600
+    os.utime(old, (ancient, ancient))
+
+    assert cap.prune(ttl_hours=168) == 1
+    assert not old.exists()
+
+
+def test_disabled_capture_prune_is_a_noop(tmp_path):
+    assert DebugCapture(None).prune(ttl_hours=168) == 0
+
+
 def test_stream_transcript_reassembles_a_response():
     t = _StreamTranscript()
     t.observe({"choices": [{"delta": {"reasoning_content": "thinking..."}}]})

@@ -250,6 +250,13 @@ class ServerConfig(BaseModel):
     # deliberately opt-in and should be pointed somewhere private.
     debug_capture_dir: Path | None = None
 
+    # Per-session cap on the capture file. Each turn appends the whole (growing)
+    # conversation, so an unbounded capture would dwarf even the archive on a
+    # long session; when a session exceeds this the oldest exchanges are dropped
+    # first. Captures are also pruned on the archive TTL so leaving capture on
+    # during real work cannot fill the disk.
+    capture_max_mb: int = 50
+
     @property
     def effective_archive_ttl_hours(self) -> int:
         return (

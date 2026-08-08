@@ -27,6 +27,9 @@ server:
   # payload missing content points at translation. Payloads hold full
   # conversation text — keep this path private and clean it up when done.
   # debug_capture_dir: ~/.ctxproxy/capture
+  # capture_max_mb: 50         # per-session cap; oldest exchanges dropped first.
+                               # Captures are pruned on the archive TTL too, so
+                               # it is safe to leave capture on during real work.
 
 policy:
   # Reduce once usable context exceeds this fraction of the budget.

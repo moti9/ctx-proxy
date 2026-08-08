@@ -27,16 +27,19 @@ async def _prune(state, ttl_hours: int, archive_ttl_hours: int | None = None) ->
     """
     try:
         ledgers = await state.store.prune(ttl_hours)
-        archives = await asyncio.to_thread(
-            state.archive.prune, archive_ttl_hours or ttl_hours
-        )
-        if ledgers or archives:
+        archive_ttl = archive_ttl_hours or ttl_hours
+        archives = await asyncio.to_thread(state.archive.prune, archive_ttl)
+        # Captures are debug transcripts like archives — same short TTL.
+        captures = await asyncio.to_thread(state.capture.prune, archive_ttl)
+        if ledgers or archives or captures:
             log.info(
-                "retention: removed %d ledger(s) (>%dh) and %d archive(s) (>%dh)",
+                "retention: removed %d ledger(s) (>%dh), %d archive(s) and "
+                "%d capture(s) (>%dh)",
                 ledgers,
                 ttl_hours,
                 archives,
-                archive_ttl_hours or ttl_hours,
+                captures,
+                archive_ttl,
             )
     except Exception:  # noqa: BLE001 — housekeeping must never take the proxy down
         log.exception("retention sweep failed")
