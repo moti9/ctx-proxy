@@ -47,8 +47,12 @@ async def create_message(http_request: Request):
     session = derive_session_key(http_request.headers, req)
     counter = state.counter_for(profile, upstream_model)
     summarizer = state.summarizer_for(profile, req.model)
-    backend = state.backend_for(profile)
     headers = dict(http_request.headers)
+
+    # Failover chain, with any currently-cooling-down target moved to the back.
+    # A single-element list (no fallbacks configured) makes the loops below
+    # behave exactly as a direct dispatch.
+    targets = state.health.order(profile.targets(req.model))
 
     async def reduce(target_ratio: float | None = None):
         # Re-validate from the untouched body: the pipeline mutates the request
@@ -91,8 +95,9 @@ async def create_message(http_request: Request):
         session=session.value,
         source=session.source,
         model=req.model,
-        upstream=upstream_model,
-        backend=backend.name,
+        upstream=targets[0][1],
+        backend=targets[0][0],
+        fallbacks=len(targets) - 1,
         tokens=result.tokens_after,
         saved=result.saved,
         stream=req.stream,
@@ -100,71 +105,57 @@ async def create_message(http_request: Request):
 
     # -- streaming ---------------------------------------------------------- #
     if req.stream:
-        observed: list[int] = []
-        try:
-            first, stream = await _open_stream(
-                backend, prepared, upstream_model, headers, result.tokens_after,
-                observed.append, session_key=session.value,
-            )
-        except UpstreamError as exc:
-            if not (exc.is_context_overflow() and policy.overflow_retry_enabled):
-                _log_upstream_error(session.value, exc)
+        last_exc: UpstreamError | None = None
+        for i, (backend_name, upstream) in enumerate(targets):
+            backend = state.registry.get(backend_name)
+            observed: list[int] = []
+            try:
+                first, stream, tokens_after = await _open_stream_target(
+                    backend, prepared, upstream, headers, result.tokens_after,
+                    observed.append, session.value, profile, policy, reduce,
+                )
+            except UpstreamError as exc:
+                if _should_failover(exc, i, targets):
+                    state.health.mark_down((backend_name, upstream))
+                    _log_failover(session.value, (backend_name, upstream), targets[i + 1], exc)
+                    last_exc = exc
+                    continue
+                _log_upstream_error(session.value, exc, retried=i > 0)
+                return exc.to_response()
+            except ProxyError as exc:
                 return exc.to_response()
 
-            log_event(
-                log,
-                "upstream reported overflow; forcing reduction and retrying once",
-                level=logging.WARNING,
-                session=session.value,
-                tokens=result.tokens_after,
+            state.health.mark_up((backend_name, upstream))
+            return StreamingResponse(
+                _replay(first, stream, state, session.value, tokens_after, observed),
+                media_type="text/event-stream",
+                headers={"cache-control": "no-cache", "x-ctxproxy-session": session.value},
             )
-            try:
-                retry, _ = await reduce(target_ratio=policy.overflow_retry_ratio)
-                prepared = _prepare(retry.request, profile)
-                first, stream = await _open_stream(
-                    backend, prepared, upstream_model, headers, retry.tokens_after,
-                    observed.append, session_key=session.value,
-                )
-            except (UpstreamError, ProxyError) as retry_exc:
-                if isinstance(retry_exc, UpstreamError):
-                    _log_upstream_error(session.value, retry_exc, retried=True)
-                return retry_exc.to_response()
-
-        return StreamingResponse(
-            _replay(first, stream, state, session.value, result.tokens_after, observed),
-            media_type="text/event-stream",
-            headers={"cache-control": "no-cache", "x-ctxproxy-session": session.value},
-        )
+        return last_exc.to_response()  # every target failed with a retryable error
 
     # -- non-streaming ------------------------------------------------------ #
-    try:
-        payload = await backend.complete(
-            prepared, upstream_model, headers, session_key=session.value
-        )
-    except UpstreamError as exc:
-        if not (exc.is_context_overflow() and policy.overflow_retry_enabled):
-            _log_upstream_error(session.value, exc)
+    last_exc = None
+    for i, (backend_name, upstream) in enumerate(targets):
+        backend = state.registry.get(backend_name)
+        try:
+            payload = await _complete_target(
+                backend, prepared, upstream, headers, session.value, profile, policy, reduce,
+            )
+        except UpstreamError as exc:
+            if _should_failover(exc, i, targets):
+                state.health.mark_down((backend_name, upstream))
+                _log_failover(session.value, (backend_name, upstream), targets[i + 1], exc)
+                last_exc = exc
+                continue
+            _log_upstream_error(session.value, exc, retried=i > 0)
+            return exc.to_response()
+        except ProxyError as exc:
             return exc.to_response()
 
-        log_event(
-            log,
-            "upstream reported overflow; forcing reduction and retrying once",
-            level=logging.WARNING,
-            session=session.value,
-        )
-        try:
-            retry, _ = await reduce(target_ratio=policy.overflow_retry_ratio)
-            payload = await backend.complete(
-                _prepare(retry.request, profile), upstream_model, headers,
-                session_key=session.value,
-            )
-        except (UpstreamError, ProxyError) as retry_exc:
-            if isinstance(retry_exc, UpstreamError):
-                _log_upstream_error(session.value, retry_exc, retried=True)
-            return retry_exc.to_response()
-
-    await _record_drift(state, session.value, result.tokens_after, payload)
-    return JSONResponse(payload, headers={"x-ctxproxy-session": session.value})
+        state.health.mark_up((backend_name, upstream))
+        await _record_drift(state, session.value, result.tokens_after, payload)
+        return JSONResponse(payload, headers={"x-ctxproxy-session": session.value})
+    return last_exc.to_response()  # every target failed with a retryable error
 
 
 @router.post("/v1/messages/count_tokens")
@@ -283,6 +274,78 @@ def _log_upstream_error(session_key: str, exc: UpstreamError, *, retried: bool =
         retried=retried,
         detail=exc.text[:300] + hint,
     )
+
+
+def _should_failover(exc: UpstreamError, index: int, targets: list) -> bool:
+    """A retryable upstream failure with at least one more target to try."""
+    return exc.is_retryable_upstream() and index < len(targets) - 1
+
+
+def _log_failover(session_key: str, failed, nxt, exc: UpstreamError) -> None:
+    log_event(
+        log,
+        "upstream unavailable; failing over to next model",
+        level=logging.WARNING,
+        session=session_key,
+        failed=f"{failed[0]}:{failed[1]}",
+        next=f"{nxt[0]}:{nxt[1]}",
+        status=exc.status_code,
+    )
+
+
+async def _complete_target(
+    backend, request, upstream_model, headers, session_key, profile, policy, reduce
+):
+    """Non-streaming dispatch to one target, keeping the context-overflow
+    reduce-and-retry-once. Raises UpstreamError/ProxyError; the caller decides
+    whether a retryable failure should fail over to the next target."""
+    try:
+        return await backend.complete(
+            request, upstream_model, headers, session_key=session_key
+        )
+    except UpstreamError as exc:
+        if not (exc.is_context_overflow() and policy.overflow_retry_enabled):
+            raise
+        log_event(
+            log,
+            "upstream reported overflow; forcing reduction and retrying once",
+            level=logging.WARNING,
+            session=session_key,
+        )
+        retry, _ = await reduce(target_ratio=policy.overflow_retry_ratio)
+        return await backend.complete(
+            _prepare(retry.request, profile), upstream_model, headers, session_key=session_key
+        )
+
+
+async def _open_stream_target(
+    backend, request, upstream_model, headers, tokens, on_usage,
+    session_key, profile, policy, reduce,
+):
+    """Open a stream to one target, keeping the context-overflow
+    reduce-and-retry-once. Returns (first_chunk, stream, tokens_after)."""
+    try:
+        first, stream = await _open_stream(
+            backend, request, upstream_model, headers, tokens, on_usage,
+            session_key=session_key,
+        )
+        return first, stream, tokens
+    except UpstreamError as exc:
+        if not (exc.is_context_overflow() and policy.overflow_retry_enabled):
+            raise
+        log_event(
+            log,
+            "upstream reported overflow; forcing reduction and retrying once",
+            level=logging.WARNING,
+            session=session_key,
+            tokens=tokens,
+        )
+        retry, _ = await reduce(target_ratio=policy.overflow_retry_ratio)
+        first, stream = await _open_stream(
+            backend, _prepare(retry.request, profile), upstream_model, headers,
+            retry.tokens_after, on_usage, session_key=session_key,
+        )
+        return first, stream, retry.tokens_after
 
 
 def _first_sighting(state, session_key: str) -> bool:

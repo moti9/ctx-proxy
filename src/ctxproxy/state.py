@@ -8,6 +8,7 @@ from .backends import Backend, BackendRegistry
 from .config import Config, ModelProfile
 from .context.manager import ContextManager
 from .context.summarizer import Summarizer
+from .health import HealthTracker
 from .store.archive import FoldArchive
 from .store.capture import DebugCapture
 from .store.file import FileLedgerStore
@@ -30,6 +31,7 @@ class AppState:
             config.server.state_dir / "archive", config.server.archive_max_mb
         )
         self.manager = ContextManager(config, self.store, self.archive)
+        self.health = HealthTracker(config.server.upstream_cooldown_s)
 
         # Counters hold a memo cache keyed by block content, so they must
         # outlive a single request — that cache is what keeps token counting

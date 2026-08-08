@@ -108,6 +108,22 @@ class TokenizerConfig(BaseModel):
     image_token_cost: int = 1600
 
 
+class FallbackTarget(BaseModel):
+    """One entry in a profile's failover chain.
+
+    A target the request is re-sent to when the primary (and any earlier
+    fallback) is unavailable. Same backend by default — the common case is just
+    a different model on the same gateway (e.g. kimi-latest -> claude-sonnet-4-6
+    on the same LiteLLM base_url) — but a different backend is allowed too, so a
+    kimi outage can fail over to a native Anthropic or OpenAI upstream.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str
+    backend: str | None = None
+
+
 class ModelProfile(BaseModel):
     """Per-model capability declaration. The whole design hinges on this."""
 
@@ -119,6 +135,12 @@ class ModelProfile(BaseModel):
 
     # The model name to send upstream. Defaults to the incoming name.
     upstream_model: str | None = None
+
+    # Ordered failover chain. When the primary returns a capacity/availability
+    # error (429/502/503/529), the request is re-sent to each of these in turn.
+    # The primary is always preferred and re-probed after its cooldown, so once
+    # it recovers it is used again automatically.
+    fallbacks: list[FallbackTarget] = Field(default_factory=list)
 
     native_anthropic: bool = True
 
@@ -155,6 +177,18 @@ class ModelProfile(BaseModel):
 
     def resolve_upstream_model(self, requested: str) -> str:
         return self.upstream_model or requested
+
+    def targets(self, requested: str) -> list[tuple[str, str]]:
+        """The failover chain as ordered (backend, upstream_model) pairs.
+
+        The primary first, then each fallback (defaulting to this profile's
+        backend). With no fallbacks configured this is a single element and the
+        dispatch path behaves exactly as before.
+        """
+        out = [(self.backend, self.resolve_upstream_model(requested))]
+        for fb in self.fallbacks:
+            out.append((fb.backend or self.backend, fb.model))
+        return out
 
     def matches(self, model: str) -> bool:
         return bool(re.fullmatch(_glob_to_regex(self.match), model))
@@ -257,6 +291,12 @@ class ServerConfig(BaseModel):
     # during real work cannot fill the disk.
     capture_max_mb: int = 50
 
+    # How long a failed upstream target is skipped before it is re-probed, when
+    # a profile has a `fallbacks` chain. After a 429/5xx the proxy routes to the
+    # next healthy target for this long, then tries the primary again — so a
+    # recovered top model is picked back up automatically.
+    upstream_cooldown_s: float = 30.0
+
     @property
     def effective_archive_ttl_hours(self) -> int:
         return (
@@ -285,6 +325,12 @@ class Config(BaseModel):
                     f"profile {p.match!r} references unknown backend {p.backend!r}; "
                     f"defined backends: {sorted(names)}"
                 )
+            for fb in p.fallbacks:
+                if fb.backend is not None and fb.backend not in names:
+                    raise ValueError(
+                        f"profile {p.match!r} fallback to model {fb.model!r} references "
+                        f"unknown backend {fb.backend!r}; defined backends: {sorted(names)}"
+                    )
         matches = {p.match for p in self.profiles}
         for p in self.profiles:
             if p.summarizer and p.summarizer not in matches:

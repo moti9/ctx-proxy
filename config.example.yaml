@@ -136,3 +136,17 @@ profiles:
     supports_prompt_caching: false
     tokenizer:
       kind: heuristic
+
+    # ---- Failover chain (optional) -----------------------------------------
+    # When the model above returns a capacity/availability error (429/502/503/
+    # 529 — e.g. LiteLLM "no deployments available"), the request is re-sent to
+    # each of these in order. The primary is always preferred and re-probed
+    # after server.upstream_cooldown_s, so a recovered top model is used again
+    # automatically. `backend:` defaults to this profile's backend, so the
+    # common case is just a different model on the same gateway; point it at a
+    # different backend to fail over to Anthropic/OpenAI/another cluster.
+    # fallbacks:
+    #   - model: glm-latest          # another model on the same gateway
+    #   - model: claude-sonnet-4-6   # different infra = best resilience
+    #   - backend: anthropic         # or a whole different backend
+    #     model: claude-sonnet-4-5

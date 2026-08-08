@@ -75,6 +75,16 @@ class UpstreamError(ProxyError):
     def is_context_overflow(self) -> bool:
         return bool(_OVERFLOW_RE.search(self.text))
 
+    def is_retryable_upstream(self) -> bool:
+        """A capacity/availability failure worth failing over to another model.
+
+        Deliberately narrow: 4xx client errors (bad request, auth, not found)
+        would fail the same way on any backend, so failing over would only hide
+        the real problem. These statuses mean "this deployment can't serve you
+        right now", which is exactly when another model can.
+        """
+        return self.status_code in (429, 502, 503, 529)
+
     def to_response(self) -> JSONResponse:
         if isinstance(self.body, dict) and self.body.get("type") == "error":
             return JSONResponse(status_code=self.status_code, content=self.body)
