@@ -108,6 +108,7 @@ async def create_message(http_request: Request):
             )
         except UpstreamError as exc:
             if not (exc.is_context_overflow() and policy.overflow_retry_enabled):
+                _log_upstream_error(session.value, exc)
                 return exc.to_response()
 
             log_event(
@@ -125,6 +126,8 @@ async def create_message(http_request: Request):
                     observed.append, session_key=session.value,
                 )
             except (UpstreamError, ProxyError) as retry_exc:
+                if isinstance(retry_exc, UpstreamError):
+                    _log_upstream_error(session.value, retry_exc, retried=True)
                 return retry_exc.to_response()
 
         return StreamingResponse(
@@ -140,6 +143,7 @@ async def create_message(http_request: Request):
         )
     except UpstreamError as exc:
         if not (exc.is_context_overflow() and policy.overflow_retry_enabled):
+            _log_upstream_error(session.value, exc)
             return exc.to_response()
 
         log_event(
@@ -155,6 +159,8 @@ async def create_message(http_request: Request):
                 session_key=session.value,
             )
         except (UpstreamError, ProxyError) as retry_exc:
+            if isinstance(retry_exc, UpstreamError):
+                _log_upstream_error(session.value, retry_exc, retried=True)
             return retry_exc.to_response()
 
     await _record_drift(state, session.value, result.tokens_after, payload)
@@ -249,6 +255,34 @@ async def models(http_request: Request):
 
 
 # --------------------------------------------------------------------------- #
+
+
+def _log_upstream_error(session_key: str, exc: UpstreamError, *, retried: bool = False) -> None:
+    """Make a forwarded upstream failure visible in ctxproxy's own logs.
+
+    Without this the proxy passes a 429/5xx straight through to the client and
+    logs nothing, so an upstream outage looks like ctxproxy "saw nothing" — the
+    exact confusion that sends you debugging the wrong system. Capacity/
+    availability statuses get an explicit hint that the cause is the gateway,
+    not the proxy or the context pipeline.
+    """
+    hint = ""
+    if exc.status_code in (429, 502, 503, 529):
+        hint = (
+            " | this is a gateway capacity/availability response (e.g. "
+            "'no deployments available'), not a ctxproxy or context error — "
+            "it is the upstream, and usually clears on its own"
+        )
+    log_event(
+        log,
+        "upstream error forwarded to client",
+        level=logging.WARNING,
+        session=session_key,
+        backend=exc.backend,
+        status=exc.status_code,
+        retried=retried,
+        detail=exc.text[:300] + hint,
+    )
 
 
 def _first_sighting(state, session_key: str) -> bool:

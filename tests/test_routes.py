@@ -164,6 +164,32 @@ def test_upstream_error_is_forwarded_with_status(client):
     assert payload["error"]["type"] == "rate_limit_error"
 
 
+def test_upstream_error_is_logged(client, caplog):
+    """A forwarded 429/5xx must appear in ctxproxy's own logs, not vanish."""
+    import logging
+
+    with respx.mock, caplog.at_level(logging.WARNING, logger="ctxproxy.routes"):
+        respx.post(OPENAI_URL).mock(
+            return_value=httpx.Response(
+                429,
+                json={"error": {"message": "No deployments available for selected model"}},
+            )
+        )
+        client.post("/v1/messages", json=body())
+
+    events = [
+        getattr(r, "_ctxproxy_event", {})
+        for r in caplog.records
+        if r.message == "upstream error forwarded to client"
+    ]
+    assert events, "the forwarded upstream error must be logged"
+    event = events[0]
+    assert event["status"] == 429
+    assert event["backend"] == "internal"
+    assert "gateway capacity" in event["detail"], "429 must carry the 'it's the gateway' hint"
+    assert "No deployments available" in event["detail"]
+
+
 def test_context_overflow_triggers_one_forced_retry(client):
     """A context-limit rejection must become a transparent recovery, not a dead session."""
     responses = [
