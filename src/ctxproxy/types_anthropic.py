@@ -159,10 +159,20 @@ def block_text(block: Block) -> str:
         return f"{block.get('name', '')} {_stringify(block.get('input'))}"
     if btype == "tool_result":
         return _stringify(block.get("content"))
-    if btype in ("image", "document"):
-        # Media is counted separately; text extraction returns nothing.
+    if btype == "image":
+        # Counted separately and sent as an image part, so no text here.
         return ""
+    if btype == "document":
+        return _document_text(block)
     return _stringify(block)
+
+
+def _document_text(block: Block) -> str:
+    source = block.get("source") or {}
+    if source.get("type") == "text":
+        return source.get("data") or ""
+    kind = source.get("media_type") or "document"
+    return f"[{kind} omitted: this model can't read it; extract its text with a tool instead]"
 
 
 def _stringify(value: Any) -> str:
@@ -173,8 +183,11 @@ def _stringify(value: Any) -> str:
     if isinstance(value, list):
         return " ".join(_stringify(v) for v in value)
     if isinstance(value, dict):
-        if value.get("type") == "text":
-            return value.get("text") or ""
+        if value.get("type") in ("text", "document"):
+            return block_text(value)
+        # Never fall through to dumping base64 as text: one PDF read is 400K+ tokens.
+        if value.get("type") == "image":
+            return "[image omitted: images inside tool results are not forwarded]"
         return " ".join(f"{k} {_stringify(v)}" for k, v in value.items())
     return str(value)
 

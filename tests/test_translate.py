@@ -108,6 +108,44 @@ def test_image_block_becomes_a_data_uri():
     assert part["image_url"]["url"] == "data:image/png;base64,AAAA"
 
 
+def _tool_result_with(*blocks):
+    return Message(
+        role="user",
+        content=[{"type": "tool_result", "tool_use_id": "t1", "content": list(blocks)}],
+    )
+
+
+def test_pdf_in_tool_result_is_replaced_not_sent_as_base64():
+    pdf = {
+        "type": "document",
+        "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0x" * 1000},
+    }
+    request = make_request([user("go"), assistant_tool_call("t1"), _tool_result_with(pdf)])
+    content = anthropic_to_openai(request, model="m")["messages"][-1]["content"]
+    assert "JVBERi0x" not in content
+    assert "application/pdf omitted" in content
+
+
+def test_image_in_tool_result_is_replaced_not_sent_as_base64():
+    image = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": "iVBOR" * 1000},
+    }
+    request = make_request([user("go"), assistant_tool_call("t1"), _tool_result_with(image)])
+    content = anthropic_to_openai(request, model="m")["messages"][-1]["content"]
+    assert "iVBOR" not in content
+    assert "image omitted" in content
+
+
+def test_text_document_passes_through_as_text():
+    doc = {
+        "type": "document",
+        "source": {"type": "text", "media_type": "text/plain", "data": "hello"},
+    }
+    request = make_request([user("go"), assistant_tool_call("t1"), _tool_result_with(doc)])
+    assert anthropic_to_openai(request, model="m")["messages"][-1]["content"] == "hello"
+
+
 # --------------------------------------------------------------------------- #
 # Response direction
 # --------------------------------------------------------------------------- #
