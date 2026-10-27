@@ -157,6 +157,7 @@ profiles:
   # Referenced only via a `fallbacks:` chain — give them `match` names that are
   # NOT model ids any client sends. Each is a full profile, so failover can
   # cross providers (a different backend) and models of any size.
+  # A normal selectable profile can be a fallback too; no backup copy needed.
   # - match: "backup-fast"
   #   backend: internal
   #   upstream_model: some-other-vllm-model
