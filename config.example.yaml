@@ -45,6 +45,7 @@ policy:
 
   keep_recent_turns: 8            # always kept verbatim
   keep_recent_tool_results: 6     # tool payloads exempt from clearing
+  max_tool_result_tokens: 20000   # over budget, larger results get head+tail trimmed; 0 = off
   min_messages_to_compact: 12
 
   # Cheapest and least lossy first. Junk is evicted before reasoning is ever

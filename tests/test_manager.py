@@ -7,6 +7,7 @@ import json
 import pytest
 from conftest import (
     assistant,
+    assistant_tool_call,
     build_conversation,
     build_text_heavy_conversation,
     make_request,
@@ -14,6 +15,7 @@ from conftest import (
     user,
 )
 
+from ctxproxy.config import ReductionPolicy
 from ctxproxy.context.ledger import SessionLedger
 from ctxproxy.context.manager import ContextManager
 from ctxproxy.store.file import FileLedgerStore
@@ -287,6 +289,42 @@ async def test_cleared_tool_result_names_the_call_and_says_to_re_run(
     assert "read_file" in sample, "placeholder must name the call that produced it"
     assert "src/mod_" in sample, "placeholder must carry the call's arguments"
     assert "do not" in sample.lower() and "memory" in sample.lower()
+
+
+def _with_huge_latest_result(size: int = 200_000) -> list[Message]:
+    head = "HEAD-MARKER " + "a" * 100
+    tail = "b" * 100 + " TAIL-MARKER"
+    return [
+        *build_conversation(exchanges=2, payload_size=200),
+        assistant_tool_call("toolu_big", path="huge.log"),
+        tool_result("toolu_big", head + "x" * size + tail),
+    ]
+
+
+async def test_huge_latest_tool_result_is_truncated_to_fit(config, tmp_path, counter):
+    """The newest result is exempt from clearing, so without a cap it can never fit."""
+    config = config.model_copy(update={"policy": ReductionPolicy(max_tool_result_tokens=3000)})
+    manager = ContextManager(config, FileLedgerStore(tmp_path / "sessions"))
+    request = make_request(_with_huge_latest_result())
+    profile = config.profiles[1]
+
+    result, _ = await run(manager, request, profile, counter, FakeSummarizer())
+
+    content = request.messages[-1].blocks()[0]["content"]
+    assert result.tokens_after <= result.budget
+    assert content.startswith("HEAD-MARKER") and content.endswith("TAIL-MARKER")
+    assert "truncated to fit the context window" in content
+    assert counter.count_text(content) <= 3000
+
+
+async def test_tool_result_cap_can_be_disabled(config, tmp_path, counter):
+    config = config.model_copy(update={"policy": ReductionPolicy(max_tool_result_tokens=0)})
+    manager = ContextManager(config, FileLedgerStore(tmp_path / "sessions"))
+    request = make_request(_with_huge_latest_result())
+
+    await run(manager, request, config.profiles[1], counter, FakeSummarizer())
+
+    assert "truncated" not in request.messages[-1].blocks()[0]["content"]
 
 
 async def test_dropped_anchors_are_reattached_to_the_summary():

@@ -154,7 +154,9 @@ class ClearToolResults:
             ctx.tokens -= before - after
             cleared += 1
 
-        if not cleared:
+        truncated = _truncate_oversized(ctx, positions)
+
+        if not cleared and not truncated:
             return None
 
         return ReductionEvent(
@@ -163,8 +165,54 @@ class ClearToolResults:
             tokens_after=ctx.tokens,
             messages_before=len(ctx.messages),
             messages_after=len(ctx.messages),
-            detail=f"cleared {cleared} tool result(s)",
+            detail=f"cleared {cleared}, truncated {truncated} tool result(s)",
         )
+
+
+def _truncate_oversized(ctx: ReductionContext, positions: list[tuple[int, int]]) -> int:
+    cap = ctx.policy.max_tool_result_tokens
+    if cap <= 0:
+        return 0
+
+    truncated = 0
+    for msg_idx, block_idx in positions:
+        if ctx.under_target:
+            break
+        block = ctx.messages[msg_idx].blocks()[block_idx]
+        text = _plain_tool_result_text(block)
+        if text is None:
+            continue
+        before = ctx.count_block(block)
+        if before <= cap:
+            continue
+
+        # Token counts don't map to character offsets, so scale with 10% slack.
+        keep = int(len(text) * cap / before * 0.9)
+        head, tail = text[: keep // 2], text[len(text) - keep // 2 :]
+        omitted = len(text) - len(head) - len(tail)
+        replacement = dict(block)
+        replacement["content"] = (
+            f"{head}\n\n[... {omitted} characters truncated to fit the context window. "
+            f"Re-run the tool more narrowly (offset/limit, head, grep) if you need "
+            f"this part ...]\n\n{tail}"
+        )
+        after = ctx.count_block(replacement)
+        _replace_block(ctx.messages, msg_idx, block_idx, replacement)
+        ctx.tokens -= before - after
+        truncated += 1
+    return truncated
+
+
+def _plain_tool_result_text(block: dict) -> str | None:
+    """The result's text, or None if it carries media that flattening would lose."""
+    content = block.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list) and all(
+        isinstance(part, dict) and part.get("type") == "text" for part in content
+    ):
+        return "\n".join(part.get("text") or "" for part in content)
+    return None
 
 
 # --------------------------------------------------------------------------- #

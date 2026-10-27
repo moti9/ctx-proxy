@@ -191,6 +191,11 @@ class ReductionPolicy(BaseModel):
     # Verbatim tool results kept at the tail before clearing kicks in.
     keep_recent_tool_results: int = 6
 
+    # When over budget, any tool result above this is trimmed to head + tail,
+    # even a recent or protected one; otherwise one huge result can't be reduced.
+    # 0 disables.
+    max_tool_result_tokens: int = 20_000
+
     # Conversation turns always kept verbatim (the Protected Set tail).
     keep_recent_turns: int = 8
 
